@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zme-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Zeug Memory Engine as an MCP server — hybrid search, knowledge graph, and durable notes over stdio or streamable HTTP. ChatGPT deep-research compatible."
 readme = "README.md"
 requires-python = ">=3.10"
