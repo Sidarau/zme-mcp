@@ -29,6 +29,8 @@ import urllib.parse
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8378"
+OWNER_PASS = os.environ.get("VERIFY_OWNER_PASS", "s3cret")
+VIEWER_PASS = os.environ.get("VERIFY_VIEWER_PASS", "viewonly")
 failures = 0
 
 
@@ -114,10 +116,10 @@ def main() -> int:
         check("authorization-server metadata", asm.status_code == 200)
 
         # 2-5. full dance for owner and viewer
-        owner_token, owner_scopes = oauth_dance(client, "alex", "s3cret")
+        owner_token, owner_scopes = oauth_dance(client, "alex", OWNER_PASS)
         check("owner dance", bool(owner_token))
         check("owner scopes include write", "zme:write" in owner_scopes, str(owner_scopes))
-        viewer_token, viewer_scopes = oauth_dance(client, "guest", "viewonly")
+        viewer_token, viewer_scopes = oauth_dance(client, "guest", VIEWER_PASS)
         check("viewer dance", bool(viewer_token))
         check("viewer scopes are read-only",
               viewer_scopes == ["zme:read"], str(viewer_scopes))
