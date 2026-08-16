@@ -39,7 +39,8 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.tools.tool import ToolAnnotations
 
 from .auth import build_auth
-from .backend import KNOWLEDGE_TYPES, NOTE_TYPES, ZME
+from .backend import (KNOWLEDGE_TYPES, NOTE_TYPES, SEARCHABLE_TYPES, ZME,
+                      coverage_gaps, diversify, finance_evidence_bundle)
 
 INSTRUCTIONS = """\
 ZME (Zeug Memory Engine) — hybrid retrieval over Zeug's collected knowledge
@@ -88,26 +89,41 @@ def build_server(*, http: bool = False, base_url: str = "") -> FastMCP:
     # ------------------------------------------------------------------
 
     @mcp.tool(annotations=READ_ONLY)
-    async def search(query: str) -> dict[str, Any]:
+    async def search(query: str, published_after: str | None = None,
+                     published_before: str | None = None,
+                     source_keys: list[str] | None = None,
+                     content_types: list[str] | None = None,
+                     per_source_cap: int = 3,
+                     exclude_short_form: bool = True) -> dict[str, Any]:
         """Search Zeug's knowledge base. Returns {results: [{id, title, url}]} —
-        call fetch(id) for full content. Natural-language questions work best."""
+        call fetch(id) for full content. Use RFC 3339 published_after / published_before
+        and canonical source_keys for current-period or exact-source requests. These are
+        enforced filters; records with unprovable dates/source identity are excluded."""
+        source_types = (KNOWLEDGE_TYPES if content_types is None else
+                        [value for value in content_types if value in SEARCHABLE_TYPES])
+        if not source_types:
+            return {"results": []}
         rows = await anyio.to_thread.run_sync(
-            lambda: _client().search(query, k=12, source_types=KNOWLEDGE_TYPES))
+            lambda: _client().search(
+                query, k=24 if (published_after or published_before or source_keys) else 12,
+                source_types=source_types,
+                published_after=published_after, published_before=published_before,
+                source_keys=source_keys,
+                exclude_short_form=exclude_short_form))
         # Results are documents, not chunks: one hit per source, best chunk
         # wins (rows arrive RRF-ordered). Otherwise three adjacent chunks of
         # one file crowd out everything else.
-        seen: set[str] = set()
         results = []
-        for r in rows:
+        cap = 8 if source_keys and len(source_keys) == 1 else per_source_cap
+        for r in diversify(rows, limit=8, per_source_cap=cap):
             sid = str(r.get("source_id"))
-            if sid in seen:
-                continue
-            seen.add(sid)
             results.append({"id": r["chunk_id"],
                             "title": r.get("source_title") or "(untitled)",
-                            "url": r.get("source_url") or f"zme://sources/{sid}"})
-            if len(results) >= 8:
-                break
+                            "url": r.get("source_url") or f"zme://sources/{sid}",
+                            "source_key": r.get("source_key"),
+                            "published_at": r.get("published_at"),
+                            "ingested_at": r.get("ingested_at"),
+                            "content_type": r.get("source_type")})
         return {"results": results}
 
     @mcp.tool(annotations=READ_ONLY)
@@ -123,7 +139,61 @@ def build_server(*, http: bool = False, base_url: str = "") -> FastMCP:
                 "text": row.get("content") or "",
                 "url": row.get("source_url") or f"zme://sources/{row.get('source_id')}",
                 "metadata": {"source_type": row.get("source_type"),
+                             "source_key": row.get("source_key"),
+                             "published_at": row.get("published_at"),
+                             "ingested_at": row.get("ingested_at"),
+                             "transcript_provenance": row.get("source_transcript_provenance"),
+                             "text_status": row.get("source_text_status"),
                              "chunk_index": row.get("chunk_index")}}
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def inventory(source_keys: list[str] | None = None,
+                        published_after: str | None = None,
+                        as_of: str | None = None,
+                        content_types: list[str] | None = None) -> dict[str, Any]:
+        """Audit indexed source coverage before a current-period report.
+
+        Returns current/stale/unknown-date/not-present states, publication and poll
+        timestamps, searchable-text counts, and explicit coverage gaps. A report is
+        complete only when every required source is current, searchable, and has a
+        successful collector heartbeat.
+        """
+        rows = await anyio.to_thread.run_sync(
+            lambda: _client().inventory(
+                source_keys=source_keys, source_types=content_types,
+                published_after=published_after, as_of=as_of))
+        gaps = coverage_gaps(rows)
+        health_available = any(
+            row.get("collector_health") not in (
+                None, "not_exposed", "outcome_not_exposed", "never_ingested"
+            ) for row in rows
+        )
+        return {"sources": rows,
+                "collector_health_available": health_available,
+                "coverage_complete": bool(rows) and not gaps,
+                "coverage_gaps": gaps}
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def finance_report_evidence(
+            query: str = "market regime, growth, inflation, liquidity, positioning and risk",
+            days: int = 30,
+            as_of: str | None = None,
+            source_keys: list[str] | None = None,
+            content_types: list[str] | None = None,
+            per_source_limit: int = 2) -> dict[str, Any]:
+        """Build a citable evidence bundle for a last-week or last-30-day report.
+
+        Use days=7 for last week or days=30 for the monthly view. Results are
+        grouped by canonical source and include inventory health, exact UTC
+        timestamps, recent excerpts, and explicit gaps. Synthesize each source's
+        thesis, bullish/bearish assets, confidence, disagreements, and actionable
+        implication only from the returned evidence; never hide a coverage gap.
+        """
+        return await anyio.to_thread.run_sync(
+            lambda: finance_evidence_bundle(
+                _client(), query=query, days=days, as_of=as_of,
+                source_keys=source_keys, content_types=content_types,
+                per_source_limit=per_source_limit))
 
     # ------------------------------------------------------------------
     # Native ZME tools

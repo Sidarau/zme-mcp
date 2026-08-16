@@ -8,12 +8,98 @@ Measured on the Zeug corpus: hybrid R@5 0.800 · MRR 0.562 · source-recall@10 0
 
 | Tool | What it does | Write? |
 |---|---|---|
-| `search` | One query string → `{results: [{id, title, url}]}`. ChatGPT deep-research compatible. | no |
-| `fetch` | `id` (from `search`) → full chunk text + citation URL. ChatGPT compatible. | no |
+| `search` | Query plus optional publication/source/content filters → citable results with freshness metadata. Calling it with only one query string remains ChatGPT deep-research compatible. | no |
+| `fetch` | `id` (from `search`) → full chunk text, citation URL, canonical source, publication/ingestion times, and transcript state. | no |
+| `inventory` | Source-level indexed-content coverage: current/stale/unknown-date/not-present, newest timestamps, and counts. | no |
+| `finance_report_evidence` | One source-grouped, citable evidence bundle for a 7- or 30-day market report, including explicit coverage gaps. | no |
 | `recall` | Zeug's own notes/analysis/research only — "why did we decide X" | no |
 | `why` | Causal chain between two knowledge-graph entities | no |
 | `near` | Facts around one entity, with evidence quotes | no |
 | `remember` | Record a durable note (pitfall, decision, incident). The **only** write path — backed by a `SECURITY DEFINER` function that can only create notes. | creates one note |
+
+### Current-period and exact-source search
+
+`search` accepts these optional structured fields:
+
+- `published_after` / `published_before`: RFC 3339 timestamps, enforced against
+  publication/event time (never ingestion time);
+- `source_keys`: canonical source keys or registered aliases;
+- `content_types`: ZME source types such as `article`, `social`, `podcast`, or
+  `video`. Video remains opt-in for ordinary searches so the large transcript
+  corpus does not swamp non-video research.
+- `per_source_cap`: maximum results from one canonical publisher (default 3;
+  automatically relaxed for an explicit single-source query).
+- `exclude_short_form`: excludes YouTube Shorts by default; set false only when
+  short-form video is intentionally part of the evidence set.
+
+When a date or source filter is requested, ZME fails closed: a record without
+enough metadata to prove eligibility is excluded. This prevents an old,
+high-similarity item from appearing in a “last 30 days” report.
+
+Example tool input:
+
+```json
+{
+  "query": "inflation, growth, liquidity, positioning and market regime",
+  "published_after": "2026-07-17T00:00:00Z",
+  "published_before": "2026-08-16T23:59:59Z",
+  "source_keys": ["kobeissi", "macrovoices", "forward_guidance"],
+  "content_types": ["article", "newsletter", "podcast"]
+}
+```
+
+The ingestion pipeline should persist canonical `source_key` and
+`published_at` fields for every source. Legacy X daily bundles can be normalized
+from their canonical `x://account/YYYY-MM-DD` URL; undated legacy sources are
+intentionally omitted from filtered reports until backfilled.
+
+Call `inventory` before preparing a current-period report. It is intentionally
+honest about its boundary: a legacy channel check without a success/error ledger
+is `outcome_not_exposed`; no observed check is `never_ingested`. A recent indexed
+document proves content coverage; it does not prove the collector is healthy.
+Current YouTube metadata without searchable captions is `metadata_only`; until an
+authorized transcript provider is configured, inventory reports
+`configuration_required` rather than implying that video text is available.
+
+The additive migration in
+[`sql/20260816_finance_freshness.sql`](./sql/20260816_finance_freshness.sql)
+adds that heartbeat ledger, canonical publication/source metadata, and the native
+`zme_source_inventory` RPC. During rollout, the MCP uses the native RPC when
+available and falls back to the legacy source-table audit only when the RPC is
+not yet deployed.
+
+Apply [`sql/20260816_finance_source_seed.sql`](./sql/20260816_finance_source_seed.sql)
+after the migration to register the initial required and optional finance sources.
+The seed is idempotent and contains no credentials.
+
+### Finance discovery workers
+
+The Supabase functions under [`supabase/functions`](./supabase/functions) make
+publisher ingestion observable and resumable:
+
+- `zme-finance-discovery` polls the official MacroVoices RSS feed, resolves its
+  publisher-hosted transcript PDF links, records exact publication timestamps,
+  and writes a success/error heartbeat without treating metadata as full text;
+- `zme-finance-transcripts` processes one pending transcript per invocation,
+  extracts text with pinned `unpdf@1.8.1`, records `publisher_pdf` provenance,
+  and invokes `zme-index` only after extraction succeeds;
+- `zme-lyn-alden` polls the publisher's public WordPress RSS feed, extracts the
+  public article body, and records an exact publication timestamp. This allows
+  the inventory to distinguish a healthy but quiet publisher from a failed
+  collector;
+- `zme-index` writes long transcripts in bounded chunk batches so one large
+  vector insert does not exceed the database statement timeout.
+
+The corresponding cron scripts use a publishable key stored in Supabase Vault;
+no API key is committed. Discovery runs hourly at minute 12 and one transcript
+job runs at minute 18. The first production backfill indexed five MacroVoices
+transcripts (264 chunks), including four documents in the 30-day window.
+The initial Lyn Alden run indexed the latest public article into seven chunks;
+because it was published July 15, a July 17–August 16 inventory correctly marks
+the content stale while keeping collector health healthy. Known missing paid
+feeds are bootstrapped as `not_entitled` by
+[`sql/20260816_finance_entitlement_status.sql`](./sql/20260816_finance_entitlement_status.sql),
+instead of being conflated with collector failure.
 
 ## Authentication — the zeuglab → ClawPanel auth model (alpha)
 
@@ -114,4 +200,5 @@ zme-mcp --http --host 0.0.0.0 --port 8000
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e .
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}' | .venv/bin/zme-mcp
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
