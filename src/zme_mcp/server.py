@@ -40,7 +40,7 @@ from fastmcp.tools.tool import ToolAnnotations
 
 from .auth import build_auth
 from .backend import (KNOWLEDGE_TYPES, NOTE_TYPES, SEARCHABLE_TYPES, ZME,
-                      coverage_gaps, diversify)
+                      coverage_gaps, diversify, finance_evidence_bundle)
 
 INSTRUCTIONS = """\
 ZME (Zeug Memory Engine) — hybrid retrieval over Zeug's collected knowledge
@@ -172,6 +172,28 @@ def build_server(*, http: bool = False, base_url: str = "") -> FastMCP:
                 "collector_health_available": health_available,
                 "coverage_complete": bool(rows) and not gaps,
                 "coverage_gaps": gaps}
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def finance_report_evidence(
+            query: str = "market regime, growth, inflation, liquidity, positioning and risk",
+            days: int = 30,
+            as_of: str | None = None,
+            source_keys: list[str] | None = None,
+            content_types: list[str] | None = None,
+            per_source_limit: int = 2) -> dict[str, Any]:
+        """Build a citable evidence bundle for a last-week or last-30-day report.
+
+        Use days=7 for last week or days=30 for the monthly view. Results are
+        grouped by canonical source and include inventory health, exact UTC
+        timestamps, recent excerpts, and explicit gaps. Synthesize each source's
+        thesis, bullish/bearish assets, confidence, disagreements, and actionable
+        implication only from the returned evidence; never hide a coverage gap.
+        """
+        return await anyio.to_thread.run_sync(
+            lambda: finance_evidence_bundle(
+                _client(), query=query, days=days, as_of=as_of,
+                source_keys=source_keys, content_types=content_types,
+                per_source_limit=per_source_limit))
 
     # ------------------------------------------------------------------
     # Native ZME tools

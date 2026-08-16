@@ -11,6 +11,7 @@ Measured on the Zeug corpus: hybrid R@5 0.800 · MRR 0.562 · source-recall@10 0
 | `search` | Query plus optional publication/source/content filters → citable results with freshness metadata. Calling it with only one query string remains ChatGPT deep-research compatible. | no |
 | `fetch` | `id` (from `search`) → full chunk text, citation URL, canonical source, publication/ingestion times, and transcript state. | no |
 | `inventory` | Source-level indexed-content coverage: current/stale/unknown-date/not-present, newest timestamps, and counts. | no |
+| `finance_report_evidence` | One source-grouped, citable evidence bundle for a 7- or 30-day market report, including explicit coverage gaps. | no |
 | `recall` | Zeug's own notes/analysis/research only — "why did we decide X" | no |
 | `why` | Causal chain between two knowledge-graph entities | no |
 | `near` | Facts around one entity, with evidence quotes | no |

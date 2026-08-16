@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from zme_mcp.backend import (SEARCHABLE_TYPES, ZME, _decorate, _eligible,
-                             coverage_gaps, diversify)
+                             coverage_gaps, diversify, finance_evidence_bundle)
 
 
 class MetadataNormalizationTests(unittest.TestCase):
@@ -195,6 +195,64 @@ class CoverageGateTests(unittest.TestCase):
             "display_name": "Forward Guidance",
             "reasons": ["no_searchable_full_text", "collector_configuration_required"],
         }])
+
+
+class FinanceEvidenceTests(unittest.TestCase):
+    class Client:
+        def __init__(self):
+            self.search_args = None
+
+        def inventory(self, **_kwargs):
+            return [{
+                "source_key": "macrovoices", "display_name": "MacroVoices",
+                "required": True, "state": "content_current",
+                "documents_in_window": 4, "full_text_in_window": 4,
+                "collector_health": "healthy",
+                "latest_published_at": "2026-08-13T16:40:29+00:00",
+            }, {
+                "source_key": "forward_guidance", "display_name": "Forward Guidance",
+                "required": True, "state": "content_current",
+                "documents_in_window": 7, "full_text_in_window": 0,
+                "collector_health": "configuration_required",
+                "latest_published_at": "2026-08-14T10:00:17+00:00",
+            }]
+
+        def search(self, query, **kwargs):
+            self.search_args = (query, kwargs)
+            return [{
+                "chunk_id": "chunk-1", "source_id": "episode-545",
+                "source_key": "macrovoices", "source_title": "Episode 545",
+                "source_url": "https://example.com/545",
+                "published_at": "2026-08-13T16:40:29+00:00",
+                "source_type": "podcast", "content": "Liquidity is tightening.",
+            }]
+
+    def test_bundle_groups_evidence_and_discloses_gaps(self):
+        client = self.Client()
+        result = finance_evidence_bundle(
+            client, "liquidity", days=30, as_of="2026-08-16T23:59:59Z")
+        self.assertEqual(result["window"]["published_after"],
+                         "2026-07-17T23:59:59+00:00")
+        self.assertFalse(result["coverage_complete"])
+        self.assertEqual(client.search_args[1]["source_keys"], ["macrovoices"])
+        by_source = {row["source_key"]: row for row in result["sources"]}
+        self.assertEqual(by_source["macrovoices"]["evidence"][0]["id"], "chunk-1")
+        self.assertEqual(by_source["forward_guidance"]["evidence"], [])
+        self.assertIn("collector_configuration_required",
+                      result["coverage_gaps"][0]["reasons"])
+
+    def test_explicit_optional_source_is_coverage_gated(self):
+        client = self.Client()
+        client.inventory = lambda **_kwargs: [{
+            "source_key": "wealthion", "required": False,
+            "state": "not_present", "documents_in_window": 0,
+            "full_text_in_window": 0, "collector_health": "never_ingested",
+        }]
+        result = finance_evidence_bundle(
+            client, "markets", source_keys=["wealthion"],
+            as_of="2026-08-16T23:59:59Z")
+        self.assertFalse(result["coverage_complete"])
+        self.assertEqual(result["coverage_gaps"][0]["source_key"], "wealthion")
 
 
 if __name__ == "__main__":

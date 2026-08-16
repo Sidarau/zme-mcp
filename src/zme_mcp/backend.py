@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -205,6 +205,91 @@ def coverage_gaps(rows: list[dict], required_only: bool = True) -> list[dict]:
                          "display_name": row.get("display_name"),
                          "reasons": reasons})
     return gaps
+
+
+def finance_evidence_bundle(client: "ZME", query: str, days: int = 30,
+                            as_of: str | None = None,
+                            source_keys: list[str] | None = None,
+                            content_types: list[str] | None = None,
+                            per_source_limit: int = 2) -> dict:
+    """Return one bounded, source-grouped evidence set for a market report.
+
+    This is intentionally retrieval-only: the calling model synthesizes thesis,
+    asset direction, disagreements, confidence, and actions from cited excerpts.
+    """
+    if not 1 <= days <= 90:
+        raise ValueError("days must be between 1 and 90")
+    if not 1 <= per_source_limit <= 3:
+        raise ValueError("per_source_limit must be between 1 and 3")
+    end = _parse_time(as_of) if as_of else datetime.now(timezone.utc)
+    if as_of and end is None:
+        raise ValueError(f"invalid as_of: {as_of}")
+    assert end is not None
+    start = end - timedelta(days=days)
+    published_after = start.isoformat()
+    published_before = end.isoformat()
+    types = content_types or SEARCHABLE_TYPES
+    types = [value for value in types if value in SEARCHABLE_TYPES]
+    if not types:
+        raise ValueError("content_types contains no searchable type")
+
+    inventory = client.inventory(
+        source_keys=source_keys, source_types=types,
+        published_after=published_after, as_of=published_before)
+    searchable_keys = [
+        str(row["source_key"]) for row in inventory
+        if row.get("source_key")
+        and row.get("state") == "content_current"
+        and int(row.get("full_text_in_window") or 0) > 0
+    ]
+    rows: list[dict] = []
+    if searchable_keys:
+        target = min(max(len(searchable_keys) * per_source_limit * 4, 24), 120)
+        rows = client.search(
+            query, k=target, source_types=types,
+            published_after=published_after, published_before=published_before,
+            source_keys=searchable_keys, exclude_short_form=True)
+
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    seen: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        key = str(row.get("source_key") or "")
+        document = str(row.get("source_id") or "")
+        if not key or not document or document in seen[key]:
+            continue
+        if len(grouped[key]) >= per_source_limit:
+            continue
+        seen[key].add(document)
+        grouped[key].append({
+            "id": row.get("chunk_id"),
+            "title": row.get("source_title") or "(untitled)",
+            "url": row.get("source_url") or f"zme://sources/{document}",
+            "published_at": row.get("published_at"),
+            "content_type": row.get("source_type"),
+            "excerpt": (row.get("content") or "")[:1600],
+        })
+
+    sources = []
+    for item in inventory:
+        source = dict(item)
+        source["evidence"] = grouped.get(str(item.get("source_key")), [])
+        sources.append(source)
+    gaps = coverage_gaps(inventory, required_only=source_keys is None)
+    return {
+        "window": {"published_after": published_after,
+                   "published_before": published_before,
+                   "days": days},
+        "query": query,
+        "coverage_complete": bool(inventory) and not gaps,
+        "coverage_gaps": gaps,
+        "sources": sources,
+        "synthesis_contract": {
+            "fields": ["latest_item", "timestamp", "thesis",
+                       "bullish_assets", "bearish_assets", "confidence",
+                       "disagreements", "actionable_implication"],
+            "rule": "Synthesize only from evidence and disclose every coverage gap.",
+        },
+    }
 
 
 def _resolve_key(env: str, noxkey_path: str | None, what: str,
