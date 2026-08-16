@@ -185,6 +185,28 @@ def diversify(rows: list[dict], limit: int = 8, per_source_cap: int = 3) -> list
     return output
 
 
+def coverage_gaps(rows: list[dict], required_only: bool = True) -> list[dict]:
+    """Explain why an inventory cannot support a complete current report."""
+    gaps = []
+    for row in rows:
+        if required_only and not row.get("required", False):
+            continue
+        reasons = []
+        if row.get("state") != "content_current":
+            reasons.append(f"content_{row.get('state') or 'unknown'}")
+        if int(row.get("documents_in_window") or 0) == 0:
+            reasons.append("no_items_in_window")
+        if int(row.get("full_text_in_window") or 0) == 0:
+            reasons.append("no_searchable_full_text")
+        if row.get("collector_health") != "healthy":
+            reasons.append(f"collector_{row.get('collector_health') or 'unknown'}")
+        if reasons:
+            gaps.append({"source_key": row.get("source_key"),
+                         "display_name": row.get("display_name"),
+                         "reasons": reasons})
+    return gaps
+
+
 def _resolve_key(env: str, noxkey_path: str | None, what: str,
                  aliases: tuple[str, ...] = (), required: bool = True) -> str | None:
     for name in (env, *aliases):

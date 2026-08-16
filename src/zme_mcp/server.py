@@ -39,7 +39,8 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.tools.tool import ToolAnnotations
 
 from .auth import build_auth
-from .backend import KNOWLEDGE_TYPES, NOTE_TYPES, SEARCHABLE_TYPES, ZME, diversify
+from .backend import (KNOWLEDGE_TYPES, NOTE_TYPES, SEARCHABLE_TYPES, ZME,
+                      coverage_gaps, diversify)
 
 INSTRUCTIONS = """\
 ZME (Zeug Memory Engine) — hybrid retrieval over Zeug's collected knowledge
@@ -152,21 +153,25 @@ def build_server(*, http: bool = False, base_url: str = "") -> FastMCP:
                         content_types: list[str] | None = None) -> dict[str, Any]:
         """Audit indexed source coverage before a current-period report.
 
-        Returns current/stale/unknown-date/not-present states, newest publication
-        and ingestion timestamps, and document counts. This audits indexed content,
-        not collector execution; collector_health remains not_exposed until ZME has
-        an ingestion-run heartbeat ledger.
+        Returns current/stale/unknown-date/not-present states, publication and poll
+        timestamps, searchable-text counts, and explicit coverage gaps. A report is
+        complete only when every required source is current, searchable, and has a
+        successful collector heartbeat.
         """
         rows = await anyio.to_thread.run_sync(
             lambda: _client().inventory(
                 source_keys=source_keys, source_types=content_types,
                 published_after=published_after, as_of=as_of))
-        return {"sources": rows, "collector_health_available": False,
-                "coverage_complete": bool(rows) and all(
-                    row["state"] == "content_current"
-                    and row.get("collector_health") in ("healthy", "not_exposed")
-                    for row in rows
-                )}
+        gaps = coverage_gaps(rows)
+        health_available = any(
+            row.get("collector_health") not in (
+                None, "not_exposed", "outcome_not_exposed", "never_ingested"
+            ) for row in rows
+        )
+        return {"sources": rows,
+                "collector_health_available": health_available,
+                "coverage_complete": bool(rows) and not gaps,
+                "coverage_gaps": gaps}
 
     # ------------------------------------------------------------------
     # Native ZME tools

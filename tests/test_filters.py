@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from zme_mcp.backend import SEARCHABLE_TYPES, ZME, _decorate, _eligible, diversify
+from zme_mcp.backend import (SEARCHABLE_TYPES, ZME, _decorate, _eligible,
+                             coverage_gaps, diversify)
 
 
 class MetadataNormalizationTests(unittest.TestCase):
@@ -155,6 +156,33 @@ class DiversityTests(unittest.TestCase):
             {"source_id": "same", "source_key": "reuters", "chunk_id": "b"},
         ]
         self.assertEqual([row["chunk_id"] for row in diversify(rows)], ["a"])
+
+
+class CoverageGateTests(unittest.TestCase):
+    def test_required_source_needs_current_full_text_and_healthy_collector(self):
+        rows = [{
+            "source_key": "forward_guidance", "display_name": "Forward Guidance",
+            "required": True, "state": "content_current",
+            "documents_in_window": 7, "full_text_in_window": 0,
+            "collector_health": "outcome_not_exposed",
+        }, {
+            "source_key": "wealthion", "display_name": "Wealthion",
+            "required": False, "state": "content_current",
+            "documents_in_window": 10, "full_text_in_window": 2,
+            "collector_health": "outcome_not_exposed",
+        }]
+        self.assertEqual(coverage_gaps(rows), [{
+            "source_key": "forward_guidance",
+            "display_name": "Forward Guidance",
+            "reasons": ["no_searchable_full_text", "collector_outcome_not_exposed"],
+        }])
+
+    def test_complete_required_source_has_no_gap(self):
+        self.assertEqual(coverage_gaps([{
+            "source_key": "reuters", "required": True,
+            "state": "content_current", "documents_in_window": 5,
+            "full_text_in_window": 5, "collector_health": "healthy",
+        }]), [])
 
 
 if __name__ == "__main__":
