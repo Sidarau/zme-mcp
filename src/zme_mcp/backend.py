@@ -18,12 +18,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 DEFAULT_SUPABASE_URL = "https://vmjqmrsnuxmcvetirylw.supabase.co"
 NV_URL = "https://integrate.api.nvidia.com/v1/embeddings"
@@ -33,7 +37,152 @@ NV_MODEL = "nvidia/nv-embedqa-e5-v5"
 # an unscoped natural-language search is mostly noise.
 KNOWLEDGE_TYPES = ["note", "analysis", "compiled_research", "tweet",
                    "article", "social", "newsletter", "podcast"]
+SEARCHABLE_TYPES = [*KNOWLEDGE_TYPES, "video"]
 NOTE_TYPES = ["note", "analysis", "compiled_research"]
+
+DATE_IN_TEXT = re.compile(r"(?<!\d)(20\d{2})[-/](\d{2})[-/](\d{2})(?!\d)")
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    match = DATE_IN_TEXT.fullmatch(candidate)
+    if match:
+        candidate = "-".join(match.groups()) + "T00:00:00+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _nested_values(row: dict, names: tuple[str, ...]) -> list[Any]:
+    values = [row.get(name) for name in names]
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        values.extend(metadata.get(name) for name in names)
+    return values
+
+
+def _publication_time(row: dict) -> datetime | None:
+    """Return publication/event time only; never substitute ingestion time."""
+    names = ("published_at", "publication_date", "published", "event_time",
+             "video_published_at", "post_time", "date")
+    for value in _nested_values(row, names):
+        parsed = _parse_time(value)
+        if parsed:
+            return parsed
+    # Existing X daily bundles encode their event date in the canonical URL/title.
+    for value in (row.get("source_url"), row.get("url"), row.get("source_title"), row.get("title")):
+        if isinstance(value, str) and (match := DATE_IN_TEXT.search(value)):
+            return _parse_time("-".join(match.groups()))
+    return None
+
+
+def _ingestion_time(row: dict) -> datetime | None:
+    names = ("ingested_at", "indexed_at", "created_at")
+    for value in _nested_values(row, names):
+        parsed = _parse_time(value)
+        if parsed:
+            return parsed
+    return None
+
+
+def _normal(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _source_aliases(row: dict) -> set[str]:
+    names = ("source_key", "source_slug", "slug", "channel_id", "channel_title",
+             "channel_name", "channel", "youtube_channel_id",
+             "youtube_channel_handle", "account", "author", "publisher")
+    aliases = {_normal(str(value)) for value in _nested_values(row, names) if value}
+    url = row.get("source_url") or row.get("url")
+    if isinstance(url, str):
+        parsed = urlparse(url)
+        if parsed.scheme == "x" and parsed.netloc:
+            aliases.add(_normal(parsed.netloc))
+        elif parsed.hostname:
+            host = parsed.hostname.removeprefix("www.")
+            aliases.add(_normal(host))
+            aliases.add(_normal(host.split(".")[0]))
+    return {alias for alias in aliases if alias}
+
+
+def _canonical_source_key(row: dict) -> str | None:
+    for value in _nested_values(row, ("source_key", "source_slug", "slug")):
+        if value:
+            return _normal(str(value))
+    aliases = sorted(_source_aliases(row), key=len)
+    return aliases[0] if aliases else None
+
+
+def _decorate(row: dict, source: dict | None = None) -> dict:
+    result = dict(row)
+    normalization = dict(source or {})
+    normalization.update(result)
+    if source:
+        result.update({f"source_{key}": value for key, value in source.items()
+                       if f"source_{key}" not in result})
+    # Source metadata participates in normalization but is not exposed wholesale
+    # by the MCP response.
+    published = _publication_time(normalization)
+    ingested = _ingestion_time(normalization)
+    result["published_at"] = published.isoformat() if published else None
+    result["ingested_at"] = ingested.isoformat() if ingested else None
+    result["source_key"] = _canonical_source_key(normalization)
+    result["_source_aliases"] = sorted(_source_aliases(normalization))
+    return result
+
+
+def _eligible(row: dict, published_after: str | None, published_before: str | None,
+              source_keys: list[str] | None) -> bool:
+    if published_after or published_before:
+        published = _publication_time(row)
+        # Strict by design: an unknown date cannot support a current-period claim.
+        if published is None:
+            return False
+        after = _parse_time(published_after) if published_after else None
+        before = _parse_time(published_before) if published_before else None
+        if published_after and after is None:
+            raise ValueError(f"invalid published_after: {published_after}")
+        if published_before and before is None:
+            raise ValueError(f"invalid published_before: {published_before}")
+        if after and published < after:
+            return False
+        if before and published > before:
+            return False
+    if source_keys:
+        requested = {_normal(value) for value in source_keys}
+        aliases = set(row.get("_source_aliases") or _source_aliases(row))
+        if not requested.intersection(aliases):
+            return False
+    return True
+
+
+def diversify(rows: list[dict], limit: int = 8, per_source_cap: int = 3) -> list[dict]:
+    """Preserve rank order while limiting any canonical publisher's share."""
+    if per_source_cap < 1:
+        raise ValueError("per_source_cap must be at least 1")
+    counts: Counter[str] = Counter()
+    seen_documents: set[str] = set()
+    output = []
+    for row in rows:
+        document = str(row.get("source_id"))
+        if document in seen_documents:
+            continue
+        publisher = str(row.get("source_key") or document)
+        if counts[publisher] >= per_source_cap:
+            continue
+        seen_documents.add(document)
+        counts[publisher] += 1
+        output.append(row)
+        if len(output) >= limit:
+            break
+    return output
 
 
 def _resolve_key(env: str, noxkey_path: str | None, what: str,
@@ -120,25 +269,168 @@ class ZME:
     # -- public surface ------------------------------------------------------
 
     def search(self, query: str, k: int = 8, mode: str = "hybrid",
-               source_types: list[str] | None = None) -> list[dict]:
+               source_types: list[str] | None = None,
+               published_after: str | None = None,
+               published_before: str | None = None,
+               source_keys: list[str] | None = None,
+               exclude_short_form: bool = True) -> list[dict]:
+        if published_after and _parse_time(published_after) is None:
+            raise ValueError(f"invalid published_after: {published_after}")
+        if published_before and _parse_time(published_before) is None:
+            raise ValueError(f"invalid published_before: {published_before}")
         vec = self.embed_query(query) if mode in ("hybrid", "vector") else None
-        rows = self.rpc("zme_search_hybrid", {
+        filtering = bool(
+            published_after or published_before or source_keys
+            or (exclude_short_form and source_types and "video" in source_types)
+        )
+        hydrate_sources = filtering or bool(source_types and "video" in source_types)
+        # Fetch a wider semantic pool when applying metadata filters. The final
+        # result limit remains k and ineligible rows can never backfill it.
+        candidate_k = min(max(k * 12, 60), 240) if hydrate_sources else k
+        rpc_name = "zme_search_filtered" if filtering else "zme_search_hybrid"
+        rows = self.rpc(rpc_name, {
             "q_embedding": vec,
             "q_text": query if mode in ("hybrid", "lexical") else None,
-            "k": k,
-            "p_source_types": source_types})
-        return rows or []
+            "k": candidate_k,
+            "p_source_types": source_types,
+            "p_published_after": published_after if filtering else None,
+            "p_published_before": published_before if filtering else None,
+            "p_source_keys": source_keys if filtering else None,
+            "p_exclude_short_form": exclude_short_form if filtering else None})
+        rows = rows or []
+        if not hydrate_sources:
+            return [_decorate(row) for row in rows[:k]]
+
+        source_ids = {str(row.get("source_id")) for row in rows if row.get("source_id")}
+        source_map: dict[str, dict] = {}
+        # PostgREST `in` lists are bounded by candidate_k above. A missing source
+        # record makes the candidate unverifiable and therefore ineligible.
+        if source_ids:
+            joined = ",".join(sorted(source_ids))
+            for source in self.get(f"sources?id=in.({joined})&select=*"):
+                source_map[str(source.get("id"))] = source
+        decorated = [_decorate(row, source_map.get(str(row.get("source_id")))) for row in rows]
+        # Keep the local predicate as defense in depth against database contract
+        # drift; the filtered RPC already applies it before ranking.
+        return [row for row in decorated
+                if _eligible(row, published_after, published_before, source_keys)][:k]
 
     def fetch_chunk(self, chunk_id: str) -> dict | None:
         rows = self.get(f"chunks?id=eq.{chunk_id}"
-                        "&select=id,content,chunk_index,source_id,sources(title,url,source_type)")
+                        "&select=id,content,chunk_index,source_id,sources(*)")
         if not rows:
             return None
         row = rows[0]
         src = row.pop("sources", None) or {}
         row.update({"source_title": src.get("title"), "source_url": src.get("url"),
                     "source_type": src.get("source_type")})
-        return row
+        return _decorate(row, src)
+
+    def inventory(self, source_keys: list[str] | None = None,
+                  source_types: list[str] | None = None,
+                  published_after: str | None = None,
+                  as_of: str | None = None) -> list[dict]:
+        """Inventory indexed source documents, distinct from collector health.
+
+        This deliberately reports ``unknown_date`` and ``not_present`` instead of
+        guessing. A healthy collector requires a separate ingestion-run ledger.
+        """
+        after = _parse_time(published_after) if published_after else None
+        end = _parse_time(as_of) if as_of else datetime.now(timezone.utc)
+        if published_after and after is None:
+            raise ValueError(f"invalid published_after: {published_after}")
+        if as_of and end is None:
+            raise ValueError(f"invalid as_of: {as_of}")
+
+        try:
+            native = self.rpc("zme_source_inventory", {
+                "p_source_keys": source_keys,
+                "p_published_after": after.isoformat() if after else None,
+                "p_as_of": end.isoformat(),
+            })
+        except RuntimeError as exc:
+            # Backward-compatible rollout: only a missing RPC triggers the legacy
+            # source-table audit. Auth/network/database errors must stay visible.
+            if "404" not in str(exc):
+                raise
+            native = None
+        if native is not None:
+            return native
+
+        clauses = ["select=*"]
+        if source_types:
+            safe_types = [value for value in source_types if value in SEARCHABLE_TYPES]
+            if not safe_types:
+                return []
+            clauses.append("source_type=in.(" + ",".join(safe_types) + ")")
+        clauses.append("limit=10000")
+        sources = self.get("sources?" + "&".join(clauses))
+
+        requested = {_normal(value): value for value in (source_keys or [])}
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for source in sources:
+            decorated = _decorate({}, source)
+            aliases = set(decorated.get("_source_aliases") or [])
+            if requested and not aliases.intersection(requested):
+                continue
+            key = decorated.get("source_key") or "unidentified"
+            groups[key].append(decorated)
+
+        output: list[dict] = []
+        represented: set[str] = set()
+        for key, rows in groups.items():
+            aliases = {alias for row in rows for alias in row.get("_source_aliases", [])}
+            represented.update(aliases.intersection(requested))
+            published = [_parse_time(row.get("published_at")) for row in rows]
+            published = [value for value in published if value is not None]
+            ingested = [_parse_time(row.get("ingested_at")) for row in rows]
+            ingested = [value for value in ingested if value is not None]
+            in_window = [value for value in published
+                         if (after is None or value >= after) and value <= end]
+            latest = max(published, default=None)
+            latest_row = next((row for row in rows
+                               if _parse_time(row.get("published_at")) == latest), rows[0])
+            if not published:
+                state = "unknown_date"
+            elif in_window:
+                state = "content_current"
+            else:
+                state = "content_stale"
+            source_record = {
+                "source_key": key,
+                "state": state,
+                "documents_total": len(rows),
+                "documents_in_window": len(in_window),
+                "undated_documents": len(rows) - len(published),
+                "latest_published_at": latest.isoformat() if latest else None,
+                "latest_ingested_at": max(ingested).isoformat() if ingested else None,
+                "latest_title": latest_row.get("source_title"),
+                "latest_url": latest_row.get("source_url"),
+                "content_types": sorted({row.get("source_source_type") for row in rows
+                                          if row.get("source_source_type")}),
+                "collector_health": "not_exposed",
+            }
+            output.append(source_record)
+
+        for normalized, display in requested.items():
+            if normalized not in represented:
+                output.append({
+                    "source_key": normalized,
+                    "requested_as": display,
+                    "state": "not_present",
+                    "documents_total": 0,
+                    "documents_in_window": 0,
+                    "undated_documents": 0,
+                    "latest_published_at": None,
+                    "latest_ingested_at": None,
+                    "latest_title": None,
+                    "latest_url": None,
+                    "content_types": [],
+                    "collector_health": "not_exposed",
+                })
+        order = {"not_present": 0, "unknown_date": 1, "content_stale": 2,
+                 "content_current": 3}
+        return sorted(output, key=lambda row: (order[row["state"]], row["source_key"]))
 
     def resolve(self, name: str) -> str | None:
         return self.rpc("zme_entity_resolve", {"p_name": name}) or None
