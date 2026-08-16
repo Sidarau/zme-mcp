@@ -79,6 +79,10 @@ publisher ingestion observable and resumable:
 - `zme-finance-transcripts` processes one pending transcript per invocation,
   extracts text with pinned `unpdf@1.8.1`, records `publisher_pdf` provenance,
   and invokes `zme-index` only after extraction succeeds;
+- `zme-lyn-alden` polls the publisher's public WordPress RSS feed, extracts the
+  public article body, and records an exact publication timestamp. This allows
+  the inventory to distinguish a healthy but quiet publisher from a failed
+  collector;
 - `zme-index` writes long transcripts in bounded chunk batches so one large
   vector insert does not exceed the database statement timeout.
 
@@ -86,6 +90,12 @@ The corresponding cron scripts use a publishable key stored in Supabase Vault;
 no API key is committed. Discovery runs hourly at minute 12 and one transcript
 job runs at minute 18. The first production backfill indexed five MacroVoices
 transcripts (264 chunks), including four documents in the 30-day window.
+The initial Lyn Alden run indexed the latest public article into seven chunks;
+because it was published July 15, a July 17–August 16 inventory correctly marks
+the content stale while keeping collector health healthy. Known missing paid
+feeds are bootstrapped as `not_entitled` by
+[`sql/20260816_finance_entitlement_status.sql`](./sql/20260816_finance_entitlement_status.sql),
+instead of being conflated with collector failure.
 
 ## Authentication — the zeuglab → ClawPanel auth model (alpha)
 
