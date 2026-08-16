@@ -184,6 +184,18 @@ class CoverageGateTests(unittest.TestCase):
             "full_text_in_window": 5, "collector_health": "healthy",
         }]), [])
 
+    def test_configuration_requirement_is_explicit(self):
+        self.assertEqual(coverage_gaps([{
+            "source_key": "forward_guidance", "display_name": "Forward Guidance",
+            "required": True, "state": "content_current",
+            "documents_in_window": 7, "full_text_in_window": 0,
+            "collector_health": "configuration_required",
+        }]), [{
+            "source_key": "forward_guidance",
+            "display_name": "Forward Guidance",
+            "reasons": ["no_searchable_full_text", "collector_configuration_required"],
+        }])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,8 @@ create table if not exists public.zme_ingestion_runs (
     started_at timestamptz not null,
     finished_at timestamptz,
     status text not null check (status in (
-        'running', 'success', 'error', 'not_entitled', 'disabled'
+        'running', 'success', 'error', 'not_entitled',
+        'configuration_required', 'disabled'
     )),
     items_seen integer not null default 0 check (items_seen >= 0),
     items_inserted integer not null default 0 check (items_inserted >= 0),
@@ -202,6 +203,7 @@ select c.source_key,
            when rs.latest_poll_at is null then 'never_ingested'
            when rs.ledger_poll_at is null then 'outcome_not_exposed'
            when rs.latest_status = 'not_entitled' then 'not_entitled'
+           when rs.latest_status = 'configuration_required' then 'configuration_required'
            when rs.latest_status = 'error' then 'failing'
            when rs.latest_status = 'disabled' then 'disabled'
            when rs.latest_success_at is null then 'failing'

@@ -56,6 +56,9 @@ Call `inventory` before preparing a current-period report. It is intentionally
 honest about its boundary: a legacy channel check without a success/error ledger
 is `outcome_not_exposed`; no observed check is `never_ingested`. A recent indexed
 document proves content coverage; it does not prove the collector is healthy.
+Current YouTube metadata without searchable captions is `metadata_only`; until an
+authorized transcript provider is configured, inventory reports
+`configuration_required` rather than implying that video text is available.
 
 The additive migration in
 [`sql/20260816_finance_freshness.sql`](./sql/20260816_finance_freshness.sql)
