@@ -202,6 +202,8 @@ select c.source_key,
            when rs.latest_poll_at is null then 'never_ingested'
            when rs.ledger_poll_at is null then 'outcome_not_exposed'
            when rs.latest_status = 'not_entitled' then 'not_entitled'
+           when rs.latest_status = 'error' then 'failing'
+           when rs.latest_status = 'disabled' then 'disabled'
            when rs.latest_success_at is null then 'failing'
            when rs.latest_success_at < p_as_of - make_interval(hours => c.stale_after_hours)
                then case when rs.latest_status = 'success' then 'stale' else 'failing' end

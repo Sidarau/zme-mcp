@@ -68,6 +68,25 @@ Apply [`sql/20260816_finance_source_seed.sql`](./sql/20260816_finance_source_see
 after the migration to register the initial required and optional finance sources.
 The seed is idempotent and contains no credentials.
 
+### Finance discovery workers
+
+The Supabase functions under [`supabase/functions`](./supabase/functions) make
+publisher ingestion observable and resumable:
+
+- `zme-finance-discovery` polls the official MacroVoices RSS feed, resolves its
+  publisher-hosted transcript PDF links, records exact publication timestamps,
+  and writes a success/error heartbeat without treating metadata as full text;
+- `zme-finance-transcripts` processes one pending transcript per invocation,
+  extracts text with pinned `unpdf@1.8.1`, records `publisher_pdf` provenance,
+  and invokes `zme-index` only after extraction succeeds;
+- `zme-index` writes long transcripts in bounded chunk batches so one large
+  vector insert does not exceed the database statement timeout.
+
+The corresponding cron scripts use a publishable key stored in Supabase Vault;
+no API key is committed. Discovery runs hourly at minute 12 and one transcript
+job runs at minute 18. The first production backfill indexed five MacroVoices
+transcripts (264 chunks), including four documents in the 30-day window.
+
 ## Authentication — the zeuglab → ClawPanel auth model (alpha)
 
 This server is the **alpha ring** of the ecosystem auth design:
