@@ -1,13 +1,10 @@
 """ZME backend — direct PostgREST RPC + NVIDIA query embeddings.
 
-No local scripts, no shell-outs: this module is the whole data path, so the
-server runs anywhere (laptop stdio, Fly.io, a customer's box).
+The API data path is self-contained. An enrolled Zeug host may resolve missing
+credentials through its installed cloud client; other deployments inject env values.
 
-Credential resolution order for each key:
-  1. environment variable
-  2. `noxkey get <path> --raw` on macOS (one Touch ID prompt per keychain
-     session, then silent) — convenience for Alex's Mac, absent elsewhere
-  3. a clear error naming exactly which variable to set
+Credential resolution order: explicit environment injection, then the enrolled
+cloud vault through a private pipe. No keychain, clipboard or secret files.
 
 Security model: the server works with the Supabase *anon* key (SELECT-only,
 RLS-enforced). The only write surface is `zme_remember()`, a SECURITY DEFINER
@@ -36,25 +33,21 @@ KNOWLEDGE_TYPES = ["note", "analysis", "compiled_research", "tweet",
 NOTE_TYPES = ["note", "analysis", "compiled_research"]
 
 
-def _resolve_key(env: str, noxkey_path: str | None, what: str,
+from .zeug_credentials import resolve, CredentialError
+
+
+def _resolve_key(env: str, cloud_reference: str | None, what: str,
                  aliases: tuple[str, ...] = (), required: bool = True) -> str | None:
     for name in (env, *aliases):
-        v = os.environ.get(name)
-        if v:
-            return v.strip()
-    if noxkey_path and sys.platform == "darwin":
+        if os.environ.get(name):
+            return os.environ[name].strip()
+    if cloud_reference:
         try:
-            r = subprocess.run(["noxkey", "get", noxkey_path, "--raw"],
-                               capture_output=True, text=True, timeout=120)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            return resolve(cloud_reference, required=required)
+        except CredentialError as error:
+            raise RuntimeError(f'zme-mcp: {what} unavailable ({error}); check cloud enrollment or inject {env}.') from None
     if required:
-        raise RuntimeError(
-            f"zme-mcp: missing {what}. Set {env}=... in the environment. "
-            f"The anon key is enough — never deploy a service-role key."
-        )
+        raise RuntimeError(f'zme-mcp: missing {what}; inject {env}.')
     return None
 
 
