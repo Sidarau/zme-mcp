@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
 from mcp.server.auth.settings import ClientRegistrationOptions
@@ -106,7 +107,10 @@ class ZeuglabOAuthProvider(InMemoryOAuthProvider):
             return self._page(q, error='<span class="err">Unknown profile or bad passphrase.</span>')
 
         try:
-            client = await self.get_client(str(q["client_id"]))
+            client_id = str(q["client_id"])
+            client = await self.get_client(client_id)
+            if client is None:
+                client = await self._restore_chatgpt_client(client_id, q)
             if client is None:
                 return self._page(q, error='<span class="err">Unregistered client.</span>')
             from mcp.server.auth.provider import AuthorizationParams
@@ -123,6 +127,37 @@ class ZeuglabOAuthProvider(InMemoryOAuthProvider):
             return RedirectResponse(redirect_url, status_code=303)
         except Exception as e:  # noqa: BLE001 — surface as a login-page error
             return self._page(q, error=f'<span class="err">{type(e).__name__}: {e}</span>')
+
+    async def _restore_chatgpt_client(
+        self, client_id: str, params: dict[str, str]
+    ) -> OAuthClientInformationFull | None:
+        """Restore ChatGPT's public client registration after a Fly restart.
+
+        FastMCP keeps DCR clients in process memory. ChatGPT retains its client
+        ID, so an ordinary Fly autostop otherwise breaks an existing connector.
+        This permits only ChatGPT's fixed HTTPS connector callback—the same
+        public-client registration DCR already permits ChatGPT to create.
+        """
+        redirect_uri = params.get("redirect_uri", "")
+        parsed = urlparse(redirect_uri)
+        is_chatgpt_callback = (
+            parsed.scheme == "https"
+            and parsed.hostname == "chatgpt.com"
+            and parsed.path.startswith("/connector/oauth/")
+            and bool(parsed.path.removeprefix("/connector/oauth/"))
+        )
+        if not client_id or not is_chatgpt_callback:
+            return None
+
+        client = OAuthClientInformationFull(
+            client_id=client_id,
+            client_name="ChatGPT",
+            redirect_uris=[redirect_uri],
+            token_endpoint_auth_method="none",
+            scope="zme:read",
+        )
+        await self.register_client(client)
+        return client
 
     def _page(self, q: dict[str, Any], error: str) -> HTMLResponse:
         hidden = "".join(
