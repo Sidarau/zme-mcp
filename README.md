@@ -115,3 +115,32 @@ zme-mcp --http --host 0.0.0.0 --port 8000
 python3 -m venv .venv && .venv/bin/pip install -e .
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}' | .venv/bin/zme-mcp
 ```
+
+## Durable OAuth operations
+
+OAuth clients, authorization codes, access and refresh tokens, and rotation links
+live in SQLite at `ZME_OAUTH_DB` (local default:
+`~/.local/state/zme-mcp/oauth.sqlite3`). The database contains credentials: keep
+it private, never commit it, and never print its rows. Access token expiry leaves
+its refresh grant available. Code exchange, rotation and revocation commit
+atomically. `/revoke` uses the SDK's client-authenticated revocation handler.
+
+Fly runs exactly one machine with the encrypted `zme_oauth` volume mounted at
+`/data`. Create the volume in `sjc` before first deployment and deploy with
+`fly deploy --ha=false`; verify machine count and mount afterwards. Do not scale
+independent replicas with separate OAuth databases. Volume snapshots are enabled;
+restoring an old snapshot can resurrect revoked tokens, so invalidate restored
+grants before reopening service. A persistent volume does not make this instance
+highly available. Existing credentials lost by the former memory-only process
+require one fresh ChatGPT sign-in.
+
+Validation:
+
+```sh
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+`scripts/verify_restart.py MACHINE_ID` performs a live, read-only search/fetch
+canary and an actual Fly restart, then revokes its own grant. Inject
+`VERIFY_OWNER_PASS` and `FLY_API_TOKEN` with `zeug-key`, never on command arguments.
+OAuth secrets remain in the canary process's memory and are not logged.
