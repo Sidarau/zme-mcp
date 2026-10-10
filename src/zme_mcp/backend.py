@@ -1,13 +1,10 @@
 """ZME backend — direct PostgREST RPC + NVIDIA query embeddings.
 
-No local scripts, no shell-outs: this module is the whole data path, so the
-server runs anywhere (laptop stdio, Fly.io, a customer's box).
+The API data path is self-contained. An enrolled Zeug host may resolve missing
+credentials through its installed cloud client; other deployments inject env values.
 
-Credential resolution order for each key:
-  1. environment variable
-  2. `noxkey get <path> --raw` on macOS (one Touch ID prompt per keychain
-     session, then silent) — convenience for Alex's Mac, absent elsewhere
-  3. a clear error naming exactly which variable to set
+Credential resolution order: explicit environment injection, then the enrolled
+cloud vault through a private pipe. No keychain, clipboard or secret files.
 
 Security model: the server works with the Supabase *anon* key (SELECT-only,
 RLS-enforced). The only write surface is `zme_remember()`, a SECURITY DEFINER
@@ -26,8 +23,15 @@ import urllib.request
 from typing import Any
 
 DEFAULT_SUPABASE_URL = "https://vmjqmrsnuxmcvetirylw.supabase.co"
+# Embedding providers (migrated 2026-09-02): corpus space is snowflake/arctic-embed-l
+# @1024 (nv-embedqa-e5-v5 EOL'd 2026-08-25, 410 Gone). Argus ollama is primary,
+# NVIDIA hosted is fallback — identical weights, one space. The query-side prefix
+# is applied CLIENT-SIDE so both providers produce the same vector for the same text.
+OLLAMA_URL = os.environ.get("ZME_EMBED_URL", "http://100.113.216.73:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("ZME_EMBED_MODEL", "snowflake-arctic-embed:335m")
 NV_URL = "https://integrate.api.nvidia.com/v1/embeddings"
-NV_MODEL = "nvidia/nv-embedqa-e5-v5"
+NV_MODEL = os.environ.get("ZME_NV_MODEL", "snowflake/arctic-embed-l")
+EMBED_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 # Corpus scoping. 95.6% of eve-knowledge-base is trading-video transcripts, so
 # an unscoped natural-language search is mostly noise.
@@ -36,25 +40,21 @@ KNOWLEDGE_TYPES = ["note", "analysis", "compiled_research", "tweet",
 NOTE_TYPES = ["note", "analysis", "compiled_research"]
 
 
-def _resolve_key(env: str, noxkey_path: str | None, what: str,
+from .zeug_credentials import resolve, CredentialError
+
+
+def _resolve_key(env: str, cloud_reference: str | None, what: str,
                  aliases: tuple[str, ...] = (), required: bool = True) -> str | None:
     for name in (env, *aliases):
-        v = os.environ.get(name)
-        if v:
-            return v.strip()
-    if noxkey_path and sys.platform == "darwin":
+        if os.environ.get(name):
+            return os.environ[name].strip()
+    if cloud_reference:
         try:
-            r = subprocess.run(["noxkey", "get", noxkey_path, "--raw"],
-                               capture_output=True, text=True, timeout=120)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            return resolve(cloud_reference, required=required)
+        except CredentialError as error:
+            raise RuntimeError(f'zme-mcp: {what} unavailable ({error}); check cloud enrollment or inject {env}.') from None
     if required:
-        raise RuntimeError(
-            f"zme-mcp: missing {what}. Set {env}=... in the environment. "
-            f"The anon key is enough — never deploy a service-role key."
-        )
+        raise RuntimeError(f'zme-mcp: missing {what}; inject {env}.')
     return None
 
 
@@ -96,15 +96,26 @@ class ZME:
     # -- embeddings ----------------------------------------------------------
 
     def embed_query(self, text: str) -> str | None:
-        """Returns a pgvector literal, or None when no NVIDIA key (lexical-only).
+        """Returns a pgvector literal, or None to degrade to lexical-only.
 
-        Query side MUST use input_type=query (passages use input_type=passage);
-        the model is asymmetric and the wrong side quietly degrades recall.
+        Provider chain: Argus ollama (no key needed) -> NVIDIA hosted (needs key).
+        The query prefix is applied here, client-side; do NOT pass input_type to
+        either provider or the space diverges from the local model.
         """
+        q = EMBED_QUERY_PREFIX + text
+        try:  # primary: argus ollama over the tailnet
+            req = urllib.request.Request(
+                f"{OLLAMA_URL}/api/embed",
+                data=json.dumps({"model": OLLAMA_MODEL, "input": [q]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                vec = json.loads(resp.read())["embeddings"][0]
+                return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
+        except (urllib.error.HTTPError, OSError, KeyError, IndexError):
+            pass
         if not self.nv_key:
             return None
-        body = {"model": NV_MODEL, "input": [text],
-                "input_type": "query", "truncate": "END"}
+        body = {"model": NV_MODEL, "input": [q], "truncate": "END"}
         req = urllib.request.Request(NV_URL, data=json.dumps(body).encode(),
                                      headers={"Authorization": f"Bearer {self.nv_key}",
                                               "Content-Type": "application/json"})
