@@ -50,8 +50,8 @@ ring `beta` onwards.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ZME_SUPABASE_KEY` | yes | Supabase key for the ZME project. **The anon key is enough** (SELECT-only + `zme_remember`). Never deploy a service-role key on a shared machine. |
-| `ZME_SUPABASE_URL` | no | Defaults to Zeug's own memory project. Point at another ZME deployment (e.g. a ClawPanel tenant DB) to serve that instead. |
+| `ZME_SUPABASE_KEY` | yes | PostgREST key for the ZME deployment. **The anon key is enough** (SELECT-only + `zme_remember`). Never deploy a service-role key on a shared machine. |
+| `ZME_SUPABASE_URL` | no | Defaults to Zeug's self-hosted ZME front door (the Supabase project was retired 2026-10-09). Point at another ZME deployment (e.g. a ClawPanel tenant DB) to serve that instead. |
 | `NVIDIA_API_KEY` | no | Enables the vector arm of hybrid search. Without it, everything still works in lexical mode (which is the arm that catches exact identifiers). |
 | `ZME_AUTH` | no | `oauth` (default when profiles are set) or `token` (alpha ring only). |
 | `ZME_OAUTH_PROFILES` | oauth | JSON map of profile name → `{secret, level}`. |
