@@ -5,5 +5,7 @@ __pycache__/
 .env.*
 *.sbkey
 *.nvkey
+*.sqlite3
+*.sqlite3-*
 dist/
 *.egg-info/

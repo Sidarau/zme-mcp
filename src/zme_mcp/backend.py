@@ -25,7 +25,9 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-DEFAULT_SUPABASE_URL = "https://vmjqmrsnuxmcvetirylw.supabase.co"
+# Self-hosted ZME front door: PostgREST with an on-demand standby.
+# The former Supabase project was retired on 2026-10-09 and now answers 402.
+DEFAULT_SUPABASE_URL = "https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws"
 NV_URL = "https://integrate.api.nvidia.com/v1/embeddings"
 NV_MODEL = "nvidia/nv-embedqa-e5-v5"
 
@@ -64,7 +66,7 @@ class ZME:
     def __init__(self) -> None:
         self.base = (os.environ.get("ZME_SUPABASE_URL") or DEFAULT_SUPABASE_URL).rstrip("/") + "/rest/v1"
         self.sb_key = _resolve_key(
-            "ZME_SUPABASE_KEY", "zeuglab/claw-terminal/SUPABASE_SERVICE_ROLE_JWT_TOKEN",
+            "ZME_SUPABASE_KEY", "zeuglab/zme/ANON_JWT",
             "Supabase key", aliases=("SB_KEY",))
         # Embeddings are optional: without a key, search degrades to the
         # lexical arm (which is what catches exact identifiers anyway).

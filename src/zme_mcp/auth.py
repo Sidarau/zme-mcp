@@ -3,7 +3,7 @@
 Rings (release channels)
 ------------------------
 alpha   zeuglab ecosystem (this server). OAuth + optional legacy token.
-beta    ClawPanel. OAuth only; stores move from memory to Postgres.
+beta    ClawPanel. OAuth only; profiles move to managed identities.
 prod    ClawPanel multi-tenant. OAuth + per-profile labels, RLS-backed.
 
 Profile levels (identity → capability)
@@ -14,27 +14,51 @@ viewer    zme:read               (search/fetch/recall/why/near; no remember)
 
 This module subclasses FastMCP's InMemoryOAuthProvider — a complete OAuth 2.1
 authorization server (DCR, PKCE, authorization codes, refresh, revocation) —
-and inserts the one thing it lacks: a real login gate. The /authorize GET
+and adds a durable SQLite state store and a real login gate. The /authorize GET
 serves a passphrase form; the POST verifies (name, passphrase) against
 ZME_OAUTH_PROFILES and forces the token's scopes to that profile's level —
 requested scopes are never trusted.
 
-In beta the in-memory dicts become tables and passphrases become Supabase
-auth sessions; the scope contract (zme:read / zme:write) stays identical, so
-clients built against alpha keep working.
+Clients, grants, tokens and rotation links persist on ZME_OAUTH_DB. A single
+instance owns that database. Access expiry preserves the refresh grant; token
+rotation and revocation are atomic. The scope contract remains unchanged.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
+import html
 import json
 import os
+from pathlib import Path
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
-from mcp.server.auth.settings import ClientRegistrationOptions
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import OAuthClientInformationFull
+from mcp.server.auth.provider import AccessToken, AuthorizationCode, RefreshToken, TokenError
+from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
+
+from .oauth_store import OAuthStore
+
+
+def durable_operation(method):
+    """Atomically commit local SDK map operations, including token rotation.
+
+    The wrapped inherited methods have no network awaits. SQLite also serializes
+    token consumption by separate processes sharing this database.
+    """
+    @functools.wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        async with self._operation_lock:
+            with self.store.transaction():
+                return await method(self, *args, **kwargs)
+    return wrapped
 
 LEVEL_SCOPES: dict[str, list[str]] = {
     "owner": ["zme:read", "zme:write"],
@@ -66,18 +90,74 @@ cursor:pointer}}.err{{color:#e08585;font-size:.8rem}}</style></head>
 
 
 class ZeuglabOAuthProvider(InMemoryOAuthProvider):
-    """In-memory OAuth 2.1 AS + a passphrase login gate with profile levels."""
+    """OAuth 2.1 AS with durable state and a profile-scoped login gate."""
 
-    def __init__(self, base_url: str, profiles: dict[str, dict[str, str]]):
+    def __init__(self, base_url: str, profiles: dict[str, dict[str, str]],
+                 state_path: str | Path | None = None):
         super().__init__(
             base_url=base_url,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True, valid_scopes=ALL_SCOPES,
                 default_scopes=["zme:read"]),
             required_scopes=["zme:read"],
+            revocation_options=RevocationOptions(enabled=True),
         )
         # name -> {"secret": ..., "level": owner|operator|viewer}
         self.profiles = profiles
+        self.store = OAuthStore(state_path or os.environ.get("ZME_OAUTH_DB")
+                                or Path.home() / ".local/state/zme-mcp/oauth.sqlite3")
+        self._operation_lock = asyncio.Lock()
+        self.clients = self.store.mapping("clients", OAuthClientInformationFull)
+        self.auth_codes = self.store.mapping("auth_codes", AuthorizationCode)
+        self.access_tokens = self.store.mapping("access_tokens", AccessToken)
+        self.refresh_tokens = self.store.mapping("refresh_tokens", RefreshToken)
+        self._access_to_refresh_map = self.store.mapping("access_to_refresh")
+        self._refresh_to_access_map = self.store.mapping("refresh_to_access")
+
+    @durable_operation
+    async def register_client(self, client_info):
+        return await super().register_client(client_info)
+
+    @durable_operation
+    async def authorize(self, client, params):
+        client.validate_redirect_uri(AnyUrl(str(params.redirect_uri)))
+        return await super().authorize(client, params)
+
+    @durable_operation
+    async def load_authorization_code(self, client, authorization_code):
+        return await super().load_authorization_code(client, authorization_code)
+
+    @durable_operation
+    async def exchange_authorization_code(self, client, authorization_code):
+        current = await super().load_authorization_code(client, authorization_code.code)
+        if current is None or current != authorization_code:
+            raise TokenError("invalid_grant", "Authorization code is invalid or expired.")
+        return await super().exchange_authorization_code(client, current)
+
+    @durable_operation
+    async def load_refresh_token(self, client, refresh_token):
+        return await super().load_refresh_token(client, refresh_token)
+
+    @durable_operation
+    async def exchange_refresh_token(self, client, refresh_token, scopes):
+        current = await super().load_refresh_token(client, refresh_token.token)
+        if current is None or current != refresh_token:
+            raise TokenError("invalid_grant", "Refresh token is invalid or expired.")
+        return await super().exchange_refresh_token(client, current, scopes)
+
+    @durable_operation
+    async def load_access_token(self, token):
+        current = self.access_tokens.get(token)
+        if current is not None and current.expires_at is not None and current.expires_at < time.time():
+            # Access expiry is not grant revocation. Keep the refresh token so
+            # ChatGPT can renew its one-hour access token without signing in.
+            del self.access_tokens[token]
+            return None
+        return current
+
+    @durable_operation
+    async def revoke_token(self, token):
+        return await super().revoke_token(token)
 
     # -- routes ------------------------------------------------------------
 
@@ -106,7 +186,10 @@ class ZeuglabOAuthProvider(InMemoryOAuthProvider):
             return self._page(q, error='<span class="err">Unknown profile or bad passphrase.</span>')
 
         try:
-            client = await self.get_client(str(q["client_id"]))
+            client_id = str(q["client_id"])
+            client = await self.get_client(client_id)
+            if client is None:
+                client = await self._restore_chatgpt_client(client_id, q)
             if client is None:
                 return self._page(q, error='<span class="err">Unregistered client.</span>')
             from mcp.server.auth.provider import AuthorizationParams
@@ -119,15 +202,47 @@ class ZeuglabOAuthProvider(InMemoryOAuthProvider):
                 code_challenge=str(q["code_challenge"]),
                 resource=q.get("resource") or None,
             )
-            redirect_url = await super().authorize(client, params)
+            redirect_url = await self.authorize(client, params)
             return RedirectResponse(redirect_url, status_code=303)
         except Exception as e:  # noqa: BLE001 — surface as a login-page error
-            return self._page(q, error=f'<span class="err">{type(e).__name__}: {e}</span>')
+            return self._page(q, error=f'<span class="err">{html.escape(type(e).__name__ + ": " + str(e))}</span>')
+
+    async def _restore_chatgpt_client(
+        self, client_id: str, params: dict[str, str]
+    ) -> OAuthClientInformationFull | None:
+        """Restore ChatGPT's public client registration after a Fly restart.
+
+        FastMCP keeps DCR clients in process memory. ChatGPT retains its client
+        ID, so an ordinary Fly autostop otherwise breaks an existing connector.
+        This permits only ChatGPT's fixed HTTPS connector callback—the same
+        public-client registration DCR already permits ChatGPT to create.
+        """
+        redirect_uri = params.get("redirect_uri", "")
+        parsed = urlparse(redirect_uri)
+        is_chatgpt_callback = (
+            parsed.scheme == "https"
+            and parsed.hostname == "chatgpt.com"
+            and parsed.path.startswith("/connector/oauth/")
+            and bool(parsed.path.removeprefix("/connector/oauth/"))
+        )
+        if not client_id or not is_chatgpt_callback:
+            return None
+
+        client = OAuthClientInformationFull(
+            client_id=client_id,
+            client_name="ChatGPT",
+            redirect_uris=[redirect_uri],
+            token_endpoint_auth_method="none",
+            scope="zme:read",
+        )
+        await self.register_client(client)
+        return client
 
     def _page(self, q: dict[str, Any], error: str) -> HTMLResponse:
         hidden = "".join(
-            f'<input type="hidden" name="{k}" value="{v}">' for k, v in q.items())
-        client = q.get("client_id", "An MCP client")
+            f'<input type="hidden" name="{html.escape(str(k), quote=True)}" '
+            f'value="{html.escape(str(v), quote=True)}">' for k, v in q.items())
+        client = html.escape(str(q.get("client_id", "An MCP client")), quote=True)
         return HTMLResponse(LOGIN_PAGE.format(
             client=client, error=error, hidden=hidden))
 
