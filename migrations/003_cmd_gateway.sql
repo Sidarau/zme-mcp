@@ -5,15 +5,19 @@
 -- That role can execute exactly two functions and nothing else: no table, no other function, no Zeug memory.
 --   public.zme_ws_call   the workspace API for one call: status, search, sources, fetch, add
 --   public.zme_ws_setup  turn on memory for a project (creates its workspace)
--- cmd decides who may use which project and at which level; it passes the person's email as the actor.
--- The work runs as `zme_ws_owner`, a member of every workspace role, after declaring the one workspace for this
--- call, so forced RLS still shows only that workspace's rows. A leaked cmd JWT reaches client workspaces, never Zeug.
+--
+-- Trust boundary: cmd is the authority on who is on which project (its People and project assignments) and passes
+-- the project, the level (read or write) and the person's email. The database does not re-check membership; it
+-- guarantees that one call touches only the workspace it names, that read calls cannot add, and that nothing here
+-- reaches Zeug's own memory or any other schema. So a leaked cmd JWT (or a compromised cmd) reaches client
+-- workspaces at the levels cmd could use, never Zeug's memory. The work runs as `zme_ws_owner`, a member of every
+-- workspace role, after declaring the one workspace for this call, so forced RLS still shows only that workspace.
 
 begin;
 
 do $$
 begin
-  if not exists (select 1 from pg_roles where rolname = 'zme_ws_caller') then create role zme_ws_caller nologin; end if;
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = 'zme_ws_caller') then create role zme_ws_caller nologin; end if;
 end $$;
 grant zme_ws_caller to authenticator;                              -- PostgREST switches to it from the JWT
 grant zme_ws_caller to postgres with inherit false, set true;      -- tests
@@ -21,7 +25,7 @@ grant usage on schema zme_ws to zme_ws_caller;
 
 create or replace function zme_ws.call(p_workspace text, p_level text, p_actor text, p_op text, p_args jsonb)
 returns jsonb
-language plpgsql security definer set search_path = pg_catalog, extensions
+language plpgsql security definer set search_path = pg_catalog, extensions, pg_temp
 as $fn$
 declare a jsonb := coalesce(p_args, '{}'::jsonb); r jsonb; v extensions.vector;
 begin
@@ -66,14 +70,14 @@ grant execute on function zme_ws.call(text, text, text, text, jsonb) to zme_ws_c
 create or replace function public.zme_ws_call(p_workspace text, p_level text, p_actor text, p_op text,
                                               p_args jsonb default '{}'::jsonb)
 returns jsonb
-language sql security invoker set search_path = pg_catalog
+language sql security invoker set search_path = pg_catalog, pg_temp
 as $$ select zme_ws.call(p_workspace, p_level, p_actor, p_op, p_args) $$;
 revoke all on function public.zme_ws_call(text, text, text, text, jsonb) from public, anon, authenticated, service_role;
 grant execute on function public.zme_ws_call(text, text, text, text, jsonb) to zme_ws_caller;
 
 create or replace function public.zme_ws_setup(p_workspace text, p_title text)
 returns jsonb
-language plpgsql security definer set search_path = pg_catalog
+language plpgsql security definer set search_path = pg_catalog, pg_temp
 as $$
 begin
   perform zme_ws.create_workspace(p_workspace, p_title);   -- validates the id; idempotent

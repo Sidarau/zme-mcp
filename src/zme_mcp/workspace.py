@@ -1,9 +1,9 @@
 """Client workspaces (ZEUG-795): one Postgres schema per cmd project on omarchy ZME.
 
 The database is the security boundary (see migrations/001_workspaces.sql). Every call runs inside one transaction
-that switches to exactly one workspace role and declares that workspace; row-level security checks both. The
-connecting role holds no privileges of its own: `zme_ws_gateway` in production (ZEUG-796), `postgres` for
-administration and tests.
+that switches to exactly one workspace role and declares that workspace; row-level security checks both. This
+library is for administration and tooling on the tailnet, connected as `postgres`. Services reach workspaces through
+the narrow API in migrations/003_cmd_gateway.sql instead; no service login can switch into every workspace.
 
 Writes are chunked and embedded here, before the insert, so a note is searchable the moment `remember` returns.
 Embeddings use the same arctic-l space as Zeug's memory (ollama `snowflake-arctic-embed:335m`), so the owner can
@@ -115,7 +115,7 @@ def _vector(v: list[float] | None) -> str | None:
 # -- database ------------------------------------------------------------------------------------------------------
 
 class Workspaces:
-    """`dsn` connects as the gateway role (or postgres for admin). One connection per call."""
+    """`dsn` connects as postgres (admin and tooling). One connection per call."""
 
     def __init__(self, dsn: str | None = None) -> None:
         self.dsn = dsn or os.environ.get("ZME_WS_DSN") or ""

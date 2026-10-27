@@ -4,7 +4,8 @@
 --   psql "host=100.118.214.24 port=54322 dbname=postgres user=postgres" -X -v ON_ERROR_STOP=1 -f tests/workspace_isolation.sql
 --
 -- Creates two throwaway workspaces (A, B) and a canary in Zeug's own memory inside one transaction, tries every
--- crossing as the workspace roles, and rolls back, so nothing persists. The last line reads PASS or FAIL.
+-- crossing as the workspace roles, and rolls back, so nothing persists. The last line reads PASS or FAIL, and any
+-- failed check raises an error, so psql exits non-zero under ON_ERROR_STOP.
 
 begin;
 set local client_min_messages = warning;
@@ -85,6 +86,8 @@ insert into results (check_name, got, want) values
  pg_temp.probe(:'ar', 'zz-isol-a', $q$select count(*) from zme_ws.search('zz-isol-a', array_fill(0.01::real, array[1024])::extensions.vector, null, 50)$q$), '1'),
 ('A sees only its own registry row',
  pg_temp.probe(:'ar', 'zz-isol-a', $q$select count(*) from zme_ws.workspaces$q$), '1'),
+('A reads B''s registry row while declaring B',
+ pg_temp.probe(:'ar', 'zz-isol-b', $q$select count(*) from zme_ws.workspaces$q$), '0'),
 
 -- Cross-workspace reads
 ('A reads B''s table',
@@ -93,8 +96,8 @@ insert into results (check_name, got, want) values
  pg_temp.probe(:'ar', 'zz-isol-b', $q$select count(*) from ws_zz_isol_b.chunks$q$), 'denied 42501'),
 ('A searches B through the API',
  pg_temp.probe(:'ar', 'zz-isol-a', $q$select count(*) from zme_ws.search('zz-isol-b', null, 'wscanarybeta')$q$), 'denied 42501'),
-('A searches B through the API while declaring B',
- pg_temp.probe(:'ar', 'zz-isol-b', $q$select count(*) from zme_ws.search('zz-isol-b', null, 'wscanarybeta')$q$), 'denied 42501'),
+('A searches B through the API while declaring B',   -- B's registry row is hidden (42704) or its schema denied (42501)
+ pg_temp.probe(:'ar', 'zz-isol-b', $q$select count(*) from zme_ws.search('zz-isol-b', null, 'wscanarybeta')$q$), 'denied*'),
 
 -- Spoofed or missing workspace: RLS hides A's own rows unless the session declares A
 ('A rows visible while declaring B',
@@ -135,6 +138,12 @@ insert into results (check_name, got, want) values
 -- The gateway holds nothing until it switches to a workspace role
 ('Gateway reads A without switching',
  pg_temp.probe('zme_ws_gateway', 'zz-isol-a', $q$select count(*) from ws_zz_isol_a.chunks$q$), 'denied 42501'),
+('Gateway holds role memberships',
+ (select count(*) from pg_catalog.pg_auth_members where member = 'zme_ws_gateway'::regrole)::text, '0'),
+('Roles that can switch into A besides postgres and the owner',
+ (select count(*) from pg_catalog.pg_auth_members a join pg_catalog.pg_roles r on r.oid = a.member
+  where a.roleid in ('zme_ws_zz_isol_a_read'::regrole, 'zme_ws_zz_isol_a_write'::regrole)
+    and r.rolname not in ('postgres', 'zme_ws_owner', 'zme_ws_zz_isol_a_write'))::text, '0'),
 ('Gateway calls the API without switching',
  pg_temp.probe('zme_ws_gateway', 'zz-isol-a', $q$select count(*) from zme_ws.search('zz-isol-a', null, 'wscanaryalpha')$q$), 'denied 42501'),
 
@@ -161,6 +170,13 @@ insert into results (check_name, got, want) values
  (select count(*) from (values ('anon'), ('authenticated')) r(role), (values ('public.zme_ws_call(text,text,text,text,jsonb)'), ('public.zme_ws_setup(text,text)'), ('zme_ws.call(text,text,text,text,jsonb)')) f(fn)
   where has_function_privilege(r.role, f.fn, 'EXECUTE') and has_schema_privilege(r.role, split_part(f.fn, '.', 1), 'USAGE'))::text, '0');
 
+-- Setting up an existing workspace changes nothing (the cmd role cannot rename another project).
+insert into results (check_name, got, want) values
+('cmd gateway runs setup on an existing workspace',
+ pg_temp.probe('zme_ws_caller', null, $q$select count(*) from (select public.zme_ws_setup('zz-isol-b', 'Renamed by caller')) x$q$), '1');
+insert into results (check_name, got, want) values
+('B''s title after that setup', (select title from zme_ws.workspaces where id = 'zz-isol-b'), 'Isolation test B');
+
 insert into results (check_name, got, want)
 select r.role || ': ' || x.kind, x.n::text,
        case when r.role = 'zme_ws_caller' and x.kind = 'definer functions' then '2'   -- zme_ws.call, zme_ws_setup
@@ -177,5 +193,12 @@ from results order by n;
 select case when bool_and(got = want or (want = 'denied*' and got like 'denied %')) then 'PASS' else 'FAIL' end
        || ' (' || count(*) || ' checks)' as zme_workspace_isolation
 from results;
+
+do $$
+declare n int;
+begin
+  select count(*) into n from results where not (got = want or (want = 'denied*' and got like 'denied %'));
+  if n > 0 then raise exception 'zme workspace isolation: % check(s) failed', n; end if;
+end $$;
 
 rollback;

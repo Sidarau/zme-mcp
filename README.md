@@ -119,14 +119,16 @@ Each cmd.zeuglab.com project can get its own memory on omarchy ZME, separate fro
 1. *Privileges.* Only a workspace's own roles can use its schema. No workspace role holds any privilege on Zeug's memory in `public`, on pg_net, or on another workspace.
 2. *Row-level security, forced,* keyed to the workspace the session declares (`zme.workspace`). A wrongly granted role still sees no rows unless the session also declares that workspace.
 
-The connecting role `zme_ws_gateway` holds nothing itself. Per request, inside one transaction, it switches to one workspace role (`set local role`) and declares that workspace (`set_config('zme.workspace', …, true)`). `Workspaces` in `src/zme_mcp/workspace.py` does exactly this. A compromised gateway could reach client workspaces, never Zeug's memory.
+Services do not log in as workspace roles. cmd (and, later, the MCP server in ZEUG-796) call the narrow API in `migrations/003_cmd_gateway.sql`: one call names one workspace and one level, and the database keeps it inside that workspace. `zme_ws_gateway` is reserved and holds no memberships. The CLI and `Workspaces` in `src/zme_mcp/workspace.py` connect as postgres for administration: per call they switch to one workspace role (`set local role`) and declare that workspace (`set_config('zme.workspace', …, true)`).
+
+**Trust boundary.** cmd is the authority on who is on which project. A leaked cmd key or a compromised cmd reaches client workspaces at the levels cmd could use, never Zeug's memory.
 
 **Setup and checks** (as `postgres` unless noted):
 
 ```bash
 psql "$ZME_DB" -f migrations/001_workspaces.sql            # idempotent; re-run after changing provision()
 psql "$ZME_DB_SUPERUSER" -f migrations/002_net_hardening.sql  # once, as supabase_admin
-psql "$ZME_DB" -X -f tests/workspace_isolation.sql        # 37 checks, rolls back; last line PASS/FAIL
+psql "$ZME_DB" -X -v ON_ERROR_STOP=1 -f tests/workspace_isolation.sql   # 58 checks, rolls back; exits non-zero on any failure
 ```
 
 **CLI** (`ZME_WS_DSN` is a libpq string; the password is injected per call):

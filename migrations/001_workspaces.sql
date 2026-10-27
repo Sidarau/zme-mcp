@@ -1,26 +1,27 @@
 -- ZEUG-795: client workspaces on omarchy ZME. One schema per cmd project, row-level security forced on every table.
 --
--- Apply as `postgres` on the ZME database (tailnet 100.118.214.24:54322). Idempotent: re-running it upgrades every
--- workspace in place. Run `002_net_hardening.sql` once as the superuser too, then `tests/workspace_isolation.sql`.
+-- Apply as `postgres` on the ZME database (tailnet 100.118.214.24:54322). Idempotent: re-running it re-applies the
+-- layout to every existing workspace (upgrade_all at the end). Run `002_net_hardening.sql` once as the superuser too, then `tests/workspace_isolation.sql`.
 --
 -- Two independent locks keep a workspace's data in that workspace:
 --   1. Privileges. Workspace `x` lives in schema `ws_x`. Only `zme_ws_x_read` (and `zme_ws_x_write`, which includes
 --      it) can use that schema. No workspace role holds any privilege on Zeug's own memory in `public`.
 --   2. Row-level security, forced, keyed to the workspace the session declared (`zme.workspace`). A role that was
 --      wrongly granted another workspace's tables still sees no rows unless the session also declares that workspace.
--- The connecting role (`zme_ws_gateway`, the MCP server in ZEUG-796) holds no privileges itself: per request it
--- switches to one workspace role and declares that workspace, inside one transaction.
+-- Who reaches workspaces: cmd, through the narrow API in 003 (one call names one workspace), and administrators and
+-- tooling connected as postgres. No login role can switch into every workspace: `zme_ws_gateway` is reserved for
+-- ZEUG-796 and holds no privileges or memberships.
 
 begin;
 
 do $$
 begin
   -- Owns every workspace object. Never logs in and has no BYPASSRLS, so forced RLS binds it too.
-  if not exists (select 1 from pg_roles where rolname = 'zme_ws_owner') then create role zme_ws_owner nologin; end if;
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = 'zme_ws_owner') then create role zme_ws_owner nologin; end if;
   -- Every workspace read role belongs to it: that is what lets it call the API in schema zme_ws.
-  if not exists (select 1 from pg_roles where rolname = 'zme_ws_member') then create role zme_ws_member nologin; end if;
-  -- The MCP server's session role. NOLOGIN until ZEUG-796 gives it a password.
-  if not exists (select 1 from pg_roles where rolname = 'zme_ws_gateway') then create role zme_ws_gateway nologin; end if;
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = 'zme_ws_member') then create role zme_ws_member nologin; end if;
+  -- Reserved for the MCP server (ZEUG-796). No privileges, no memberships.
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = 'zme_ws_gateway') then create role zme_ws_gateway nologin; end if;
 end $$;
 
 -- postgres creates objects and hands them to the owner role; it already bypasses RLS, so this grants it nothing new.
@@ -51,32 +52,33 @@ grant select on zme_ws.workspaces to zme_ws_member;
 -- Helpers -------------------------------------------------------------------------------------------------------------
 
 create or replace function zme_ws.current_workspace() returns text
-language sql stable set search_path = pg_catalog
+language sql stable set search_path = pg_catalog, pg_temp
 as $$ select nullif(current_setting('zme.workspace', true), '') $$;
 
 create or replace function zme_ws.schema_for(p_id text) returns text
-language sql immutable set search_path = pg_catalog
+language sql immutable set search_path = pg_catalog, pg_temp
 as $$ select 'ws_' || replace(p_id, '-', '_') $$;
 
 create or replace function zme_ws.role_for(p_id text, p_level text) returns text
-language sql immutable set search_path = pg_catalog
+language sql immutable set search_path = pg_catalog, pg_temp
 as $$ select 'zme_ws_' || replace(p_id, '-', '_') || '_' || p_level $$;
 
 -- Same OR-over-lexemes query as public.zme_tsquery (websearch_to_tsquery ANDs every term and returns nothing for
 -- natural-language questions). A copy, so workspace roles never need anything from Zeug's schema.
 create or replace function zme_ws.tsquery(p_text text) returns tsquery
-language sql immutable set search_path = pg_catalog
+language sql immutable set search_path = pg_catalog, pg_temp
 as $$
   select nullif(array_to_string(array(select distinct lexeme from unnest(to_tsvector('english', coalesce(p_text, '')))), ' | '), '')::tsquery
 $$;
 
 drop policy if exists own_row on zme_ws.workspaces;
-create policy own_row on zme_ws.workspaces for select to zme_ws_member using (id = zme_ws.current_workspace());
+create policy own_row on zme_ws.workspaces for select to zme_ws_member
+  using (id = zme_ws.current_workspace() and pg_catalog.pg_has_role(current_user, 'zme_ws_' || replace(id, '-', '_') || '_read', 'USAGE'));
 
 -- The schema of the session's own workspace, or an error. Every API function starts here, so a caller can neither
 -- name a schema directly nor act on a workspace other than the one its session declared.
 create or replace function zme_ws._schema(p_workspace text) returns text
-language plpgsql stable set search_path = pg_catalog
+language plpgsql stable set search_path = pg_catalog, pg_temp
 as $$
 declare s text;
 begin
@@ -93,7 +95,7 @@ end $$;
 -- Provisioning (postgres only) -------------------------------------------------------------------------------------
 
 create or replace function zme_ws.provision(p_id text) returns text
-language plpgsql set search_path = pg_catalog, extensions
+language plpgsql set search_path = pg_catalog, extensions, pg_temp
 as $fn$
 declare
   s  text := zme_ws.schema_for(p_id);
@@ -105,12 +107,10 @@ begin
     raise exception 'workspace id % is not a client project id', p_id;
   end if;
 
-  if not exists (select 1 from pg_roles where rolname = rr) then execute format('create role %I nologin', rr); end if;
-  if not exists (select 1 from pg_roles where rolname = rw) then execute format('create role %I nologin', rw); end if;
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = rr) then execute format('create role %I nologin', rr); end if;
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = rw) then execute format('create role %I nologin', rw); end if;
   execute format('grant %I to %I', rr, rw);                                 -- write includes read
   execute format('grant zme_ws_member to %I', rr);
-  -- The gateway may switch to these roles but inherits nothing from them: without SET ROLE it can read nothing.
-  execute format('grant %I, %I to zme_ws_gateway with inherit false, set true', rr, rw);
   execute format('grant %I, %I to postgres with inherit false, set true', rr, rw);   -- admin and tests
   execute format('grant %I to zme_ws_owner', rw);                          -- cmd gateway (003); RLS still applies
 
@@ -182,18 +182,18 @@ begin
 end $fn$;
 
 create or replace function zme_ws.create_workspace(p_id text, p_title text) returns text
-language plpgsql set search_path = pg_catalog
+language plpgsql set search_path = pg_catalog, pg_temp
 as $$
 declare s text := zme_ws.provision(p_id);
 begin
   insert into zme_ws.workspaces (id, schema_name, title) values (p_id, s, coalesce(nullif(btrim(p_title), ''), p_id))
-  on conflict (id) do update set title = excluded.title;
+  on conflict (id) do nothing;   -- setting up an existing workspace changes nothing
   return s;
 end $$;
 
 -- Re-applies the current layout to every workspace (run after changing provision()).
 create or replace function zme_ws.upgrade_all() returns int
-language plpgsql set search_path = pg_catalog
+language plpgsql set search_path = pg_catalog, pg_temp
 as $$
 declare w record; n int := 0;
 begin
@@ -206,7 +206,7 @@ end $$;
 
 -- Deletes a workspace and everything in it. p_confirm must repeat the id.
 create or replace function zme_ws.drop_workspace(p_id text, p_confirm text) returns void
-language plpgsql set search_path = pg_catalog
+language plpgsql set search_path = pg_catalog, pg_temp
 as $$
 declare s text;
 begin
@@ -222,7 +222,7 @@ end $$;
 -- The owner copies one source from Zeug's memory into a workspace (never live access). Vectors come along: both
 -- sides use the arctic-l space. Zeug's metadata stays behind; the copy records only where it came from.
 create or replace function zme_ws.copy_from_zeug(p_workspace text, p_source_id uuid) returns uuid
-language plpgsql set search_path = pg_catalog, extensions
+language plpgsql set search_path = pg_catalog, extensions, pg_temp
 as $fn$
 declare s text; v_id uuid; src public.sources;
 begin
@@ -256,7 +256,7 @@ create or replace function zme_ws.search(
   rrf_k int default 60, candidates int default 60, p_source_types text[] default null)
 returns table (chunk_id uuid, source_id uuid, source_title text, source_url text, source_type text, chunk_index int,
                content text, rrf_score double precision, vec_rank int, lex_rank int)
-language plpgsql stable set search_path = pg_catalog, extensions
+language plpgsql stable set search_path = pg_catalog, extensions, pg_temp
 as $fn$
 declare s text := zme_ws._schema(p_workspace);
 begin
@@ -293,7 +293,7 @@ create or replace function zme_ws.add_source(
   p_workspace text, p_title text, p_text text, p_chunks jsonb,
   p_url text default null, p_source_type text default 'note', p_metadata jsonb default '{}'::jsonb)
 returns uuid
-language plpgsql set search_path = pg_catalog, extensions
+language plpgsql set search_path = pg_catalog, extensions, pg_temp
 as $fn$
 declare s text := zme_ws._schema(p_workspace); v_id uuid; v_hash text;
 begin
@@ -326,7 +326,7 @@ end $fn$;
 create or replace function zme_ws.fetch(p_workspace text, p_chunk_id uuid)
 returns table (chunk_id uuid, source_id uuid, chunk_index int, content text, source_title text, source_url text,
                source_type text)
-language plpgsql stable set search_path = pg_catalog
+language plpgsql stable set search_path = pg_catalog, pg_temp
 as $fn$
 declare s text := zme_ws._schema(p_workspace);
 begin
@@ -338,7 +338,7 @@ end $fn$;
 create or replace function zme_ws.sources(p_workspace text, p_limit int default 50)
 returns table (id uuid, title text, source_type text, url text, origin text, created_by text, created_at timestamptz,
                chunks bigint)
-language plpgsql stable set search_path = pg_catalog
+language plpgsql stable set search_path = pg_catalog, pg_temp
 as $fn$
 declare s text := zme_ws._schema(p_workspace);
 begin
@@ -349,7 +349,7 @@ begin
 end $fn$;
 
 create or replace function zme_ws.stats(p_workspace text) returns jsonb
-language plpgsql stable set search_path = pg_catalog
+language plpgsql stable set search_path = pg_catalog, pg_temp
 as $fn$
 declare s text := zme_ws._schema(p_workspace); r jsonb;
 begin
@@ -368,5 +368,17 @@ grant execute on function zme_ws.current_workspace(), zme_ws.tsquery(text), zme_
   zme_ws.add_source(text, text, text, jsonb, text, text, jsonb),
   zme_ws.fetch(text, uuid), zme_ws.sources(text, int), zme_ws.stats(text)
   to zme_ws_member;
+
+-- Earlier layouts let the gateway switch into every workspace role; remove those memberships.
+do $$
+declare m record;
+begin
+  for m in select r.rolname from pg_catalog.pg_auth_members a join pg_catalog.pg_roles r on r.oid = a.roleid
+           where a.member = 'zme_ws_gateway'::regrole loop
+    execute format('revoke %I from zme_ws_gateway', m.rolname);
+  end loop;
+end $$;
+
+select zme_ws.upgrade_all();
 
 commit;
