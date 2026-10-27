@@ -60,6 +60,7 @@ create table if not exists zme_ws.shares (
   shared_by           text not null,
   shared_at           timestamptz not null default now()
 );
+create unique index if not exists shares_once on zme_ws.shares (workspace, zeug_source_id);   -- one share per source
 alter table zme_ws.shares owner to zme_ws_owner;
 alter table zme_ws.shares enable row level security;
 alter table zme_ws.shares force row level security;

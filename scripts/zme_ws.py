@@ -16,7 +16,7 @@ Commands:
   drop <id> --confirm <id>                 delete the workspace and everything in it
   embed-pending                            add vectors to chunks stored without one (run on the tailnet)
   share <id> <zeug-source-id>... [--preview] [--publish] [--accept SRC ...] [--redact SRC ...] [--mask WORD ...]
-        [--title SRC=TITLE ...] --as EMAIL   scan Zeug sources, preview, then publish the ones you approve
+        [--title SRC=TITLE ...] --as EMAIL   scan, preview every outgoing field, publish only the sources you name
   shares <id>                              what was shared into the workspace, by whom and how
 """
 from __future__ import annotations
@@ -77,11 +77,13 @@ def main() -> int:
     elif args.cmd == "copy":
         print(ws.copy_from_zeug(args.id, args.source_id, actor=args.actor))
     elif args.cmd == "share":
-        from zme_mcp.share import prepare, publish, scan
+        # Nothing publishes unless it is named in --accept (as is) or --redact; a clean scan is not approval.
+        from zme_mcp.share import prepare, preview, publish, scan
         titles = dict(x.split("=", 1) for x in args.title)
         for s in scan(ws, args.id, args.sources, args.mask):
-            mode = "redacted" if s.source_id in args.redact else "as-is" if (not s.flags or s.source_id in args.accept) else None
-            print(f"\n{s.source_id}  {s.snap.title}  [{s.snap.source_type}, {len(s.snap.text)} chars]  flags: {len(s.flags)}  -> {mode or 'held'}")
+            mode = "redacted" if s.source_id in args.redact else "as-is" if s.source_id in args.accept else None
+            state = mode or ("not approved" if not s.flags else "held")
+            print(f"\n{s.source_id}  {s.snap.title}  [{s.snap.source_type}, {len(s.snap.text)} chars]  flags: {len(s.flags)}  -> {state}")
             for f in s.flags[:15]:
                 print(f"   {f.where} line {f.line}: {f.reason} ({f.action}): {f.text}")
             if len(s.flags) > 15:
@@ -94,8 +96,8 @@ def main() -> int:
                 print(f"   held: {e}")
                 continue
             if args.preview:
-                print(f"   --- {mode} payload: title {payload['title']!r}, url {payload['url']!r}, {len(payload['chunks'])} chunks ---")
-                print("\n".join("   | " + line for line in payload["text"].splitlines()))
+                print(f"   --- {mode} payload ---")
+                print("\n".join("   " + line for line in preview(payload).splitlines()))
             if args.publish:
                 status, new_id = publish(ws, args.id, s, mode, args.actor, payload)
                 print(f"   {status}{' as ' + new_id if new_id else ''}")
