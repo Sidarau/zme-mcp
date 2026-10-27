@@ -80,7 +80,12 @@ returns jsonb
 language plpgsql security definer set search_path = pg_catalog, pg_temp
 as $$
 begin
-  perform zme_ws.create_workspace(p_workspace, p_title);   -- validates the id; idempotent
+  -- Create only. An existing workspace is left exactly as it is (re-provisioning, which resets grants and policies,
+  -- is for administrators via upgrade_all). The lock serializes two first-time setups of the same project.
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('zme_ws:' || coalesce(p_workspace, '')));
+  if not exists (select 1 from zme_ws.workspaces where id = p_workspace) then
+    perform zme_ws.create_workspace(p_workspace, p_title);   -- validates the id
+  end if;
   return jsonb_build_object('workspace', p_workspace, 'enabled', true);
 end $$;
 revoke all on function public.zme_ws_setup(text, text) from public, anon, authenticated, service_role;

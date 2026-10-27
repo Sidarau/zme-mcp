@@ -170,12 +170,17 @@ insert into results (check_name, got, want) values
  (select count(*) from (values ('anon'), ('authenticated')) r(role), (values ('public.zme_ws_call(text,text,text,text,jsonb)'), ('public.zme_ws_setup(text,text)'), ('zme_ws.call(text,text,text,text,jsonb)')) f(fn)
   where has_function_privilege(r.role, f.fn, 'EXECUTE') and has_schema_privilege(r.role, split_part(f.fn, '.', 1), 'USAGE'))::text, '0');
 
--- Setting up an existing workspace changes nothing (the cmd role cannot rename another project).
+-- Setting up an existing workspace changes nothing: not its title, not its policies (a comment on a policy is lost
+-- if the policy is dropped and recreated).
+comment on policy ws_read on ws_zz_isol_b.sources is 'setup-must-not-touch';
 insert into results (check_name, got, want) values
 ('cmd gateway runs setup on an existing workspace',
  pg_temp.probe('zme_ws_caller', null, $q$select count(*) from (select public.zme_ws_setup('zz-isol-b', 'Renamed by caller')) x$q$), '1');
 insert into results (check_name, got, want) values
-('B''s title after that setup', (select title from zme_ws.workspaces where id = 'zz-isol-b'), 'Isolation test B');
+('B''s title after that setup', (select title from zme_ws.workspaces where id = 'zz-isol-b'), 'Isolation test B'),
+('B''s read policy after that setup',
+ (select pg_catalog.obj_description(p.oid, 'pg_policy') from pg_catalog.pg_policy p
+  where p.polname = 'ws_read' and p.polrelid = 'ws_zz_isol_b.sources'::regclass), 'setup-must-not-touch');
 
 insert into results (check_name, got, want)
 select r.role || ': ' || x.kind, x.n::text,
@@ -187,17 +192,17 @@ from (values ('zme_ws_zz_isol_a_read', '^ws_zz_isol_a$'), ('zme_ws_zz_isol_a_wri
 where not (r.role = 'zme_ws_owner' and x.kind in ('definer functions', 'schemas it can create in'));   -- it owns zme_ws and zme_ws.call
 
 select n, check_name, got, want,
-       case when got = want or (want = 'denied*' and got like 'denied %') then 'ok' else 'FAIL' end as result
+       case when coalesce(got = want or (want = 'denied*' and got like 'denied %'), false) then 'ok' else 'FAIL' end as result
 from results order by n;
 
-select case when bool_and(got = want or (want = 'denied*' and got like 'denied %')) then 'PASS' else 'FAIL' end
+select case when bool_and(coalesce(got = want or (want = 'denied*' and got like 'denied %'), false)) then 'PASS' else 'FAIL' end
        || ' (' || count(*) || ' checks)' as zme_workspace_isolation
 from results;
 
 do $$
 declare n int;
 begin
-  select count(*) into n from results where not (got = want or (want = 'denied*' and got like 'denied %'));
+  select count(*) into n from results where not coalesce(got = want or (want = 'denied*' and got like 'denied %'), false);   -- a NULL result counts as a failure
   if n > 0 then raise exception 'zme workspace isolation: % check(s) failed', n; end if;
 end $$;
 
