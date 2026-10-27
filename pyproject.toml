@@ -11,8 +11,9 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Alex Sidarau / Zeug Lab" }]
 dependencies = [
-    "fastmcp>=3.4",
+    "fastmcp>=3.4,<4",   # 4.x moved fastmcp.tools.tool
     "uvicorn>=0.30",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
