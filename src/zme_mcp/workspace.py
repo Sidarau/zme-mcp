@@ -183,5 +183,26 @@ class Workspaces:
             return str(conn.execute("select zme_ws.copy_from_zeug(%s, %s) as id",
                                     (check_id(workspace), source_id)).fetchone()["id"])
 
+    def embed_pending(self, limit: int = 500) -> dict[str, int]:
+        """Adds vectors to chunks stored without one (notes added from cmd, which cannot reach the embedder)."""
+        done: dict[str, int] = {}
+        with psycopg.connect(self.dsn, row_factory=dict_row) as conn:
+            for w in conn.execute("select id, schema_name from zme_ws.workspaces order by id").fetchall():
+                table = sql.Identifier(w["schema_name"], "chunks")
+                rows = conn.execute(sql.SQL("select id, content from {} where embedding_v is null order by created_at limit %s").format(table),
+                                    (limit,)).fetchall()
+                for i in range(0, len(rows), 32):
+                    batch = rows[i:i + 32]
+                    vectors = embed([r["content"] for r in batch])
+                    if vectors is None:
+                        raise RuntimeError(f"embedding service unreachable at {EMBED_URL}")
+                    for r, v in zip(batch, vectors):
+                        conn.execute(sql.SQL("update {} set embedding_v = %s::extensions.vector, embed_variant = %s where id = %s").format(table),
+                                     (_vector(v), EMBED_VARIANT, r["id"]))
+                    conn.commit()
+                if rows:
+                    done[w["id"]] = len(rows)
+        return done
+
     def drop(self, workspace: str, confirm: str) -> None:
         self._admin("select zme_ws.drop_workspace(%s, %s)", (check_id(workspace), confirm))

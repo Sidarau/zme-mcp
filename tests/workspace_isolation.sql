@@ -49,13 +49,13 @@ exception when others then
   return 'denied ' || sqlstate;
 end $$;
 
--- What a role can reach outside its own workspace schema, from the catalog rather than by trying.
+-- What a role can reach outside the schemas matching p_own, from the catalog rather than by trying.
 -- extensions.pg_stat_statements(_info) is readable by PUBLIC; Postgres redacts other users' query text there.
 create function pg_temp.reach(p_role text, p_own text) returns table (kind text, n bigint)
 language sql as $$
   select 'foreign tables', count(*) from pg_class c join pg_namespace s on s.oid = c.relnamespace
   where c.relkind in ('r', 'v', 'm', 'p', 'f')
-    and s.nspname !~ '^pg_' and s.nspname not in ('information_schema', 'zme_ws', coalesce(p_own, '-'))
+    and s.nspname !~ '^pg_' and s.nspname not in ('information_schema', 'zme_ws') and (p_own is null or s.nspname !~ p_own)
     and not (s.nspname = 'extensions' and c.relname in ('pg_stat_statements', 'pg_stat_statements_info'))
     and has_schema_privilege(p_role, s.oid, 'USAGE')
     and has_table_privilege(p_role, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
@@ -136,13 +136,39 @@ insert into results (check_name, got, want) values
 ('Gateway reads A without switching',
  pg_temp.probe('zme_ws_gateway', 'zz-isol-a', $q$select count(*) from ws_zz_isol_a.chunks$q$), 'denied 42501'),
 ('Gateway calls the API without switching',
- pg_temp.probe('zme_ws_gateway', 'zz-isol-a', $q$select count(*) from zme_ws.search('zz-isol-a', null, 'wscanaryalpha')$q$), 'denied 42501');
+ pg_temp.probe('zme_ws_gateway', 'zz-isol-a', $q$select count(*) from zme_ws.search('zz-isol-a', null, 'wscanaryalpha')$q$), 'denied 42501'),
+
+-- cmd's entry point (003): one JWT role, two functions, every call bound to the workspace it names
+('cmd gateway finds A''s canary in A',
+ pg_temp.probe('zme_ws_caller', null, $q$select jsonb_array_length(public.zme_ws_call('zz-isol-a', 'read', 't@example.com', 'search', '{"q":"wscanaryalpha"}')->'results')$q$), '1'),
+('cmd gateway finds B''s canary in A',
+ pg_temp.probe('zme_ws_caller', null, $q$select jsonb_array_length(public.zme_ws_call('zz-isol-a', 'read', 't@example.com', 'search', '{"q":"wscanarybeta"}')->'results')$q$), '0'),
+('cmd gateway finds Zeug''s canary in A',
+ pg_temp.probe('zme_ws_caller', null, $q$select jsonb_array_length(public.zme_ws_call('zz-isol-a', 'read', 't@example.com', 'search', '{"q":"zeugcanaryomega"}')->'results')$q$), '0'),
+('cmd gateway adds with read access',
+ pg_temp.probe('zme_ws_caller', null, $q$select count(*) from (select public.zme_ws_call('zz-isol-a', 'read', 't@example.com', 'add', '{"title":"x","text":"read access must not add notes","chunks":[{"chunk_index":0,"content":"x"}]}')) x$q$), 'denied 42501'),
+('cmd gateway adds with write access',
+ pg_temp.probe('zme_ws_caller', null, $q$select count(*) from (select public.zme_ws_call('zz-isol-a', 'write', 't@example.com', 'add', '{"title":"Delta","text":"wsaddeddelta arrived through the cmd gateway","chunks":[{"chunk_index":0,"content":"wsaddeddelta arrived through the cmd gateway"}]}')) x$q$), '1'),
+('cmd gateway finds the added note only in A',
+ pg_temp.probe('zme_ws_caller', null, $q$select jsonb_array_length(public.zme_ws_call('zz-isol-a', 'read', 't@example.com', 'search', '{"q":"wsaddeddelta"}')->'results') * 10 + jsonb_array_length(public.zme_ws_call('zz-isol-b', 'read', 't@example.com', 'search', '{"q":"wsaddeddelta"}')->'results')$q$), '10'),
+('cmd gateway reports an unknown workspace as off',
+ pg_temp.probe('zme_ws_caller', null, $q$select (public.zme_ws_call('zz-isol-none', 'read', 't@example.com', 'status')->>'enabled' = 'false')::int$q$), '1'),
+('cmd gateway role reads A''s table directly',
+ pg_temp.probe('zme_ws_caller', 'zz-isol-a', $q$select count(*) from ws_zz_isol_a.chunks$q$), 'denied 42501'),
+('cmd gateway role reads Zeug''s chunks',
+ pg_temp.probe('zme_ws_caller', null, $q$select count(*) from public.chunks$q$), 'denied 42501'),
+('anon or authenticated can call the cmd gateway',
+ (select count(*) from (values ('anon'), ('authenticated')) r(role), (values ('public.zme_ws_call(text,text,text,text,jsonb)'), ('public.zme_ws_setup(text,text)'), ('zme_ws.call(text,text,text,text,jsonb)')) f(fn)
+  where has_function_privilege(r.role, f.fn, 'EXECUTE') and has_schema_privilege(r.role, split_part(f.fn, '.', 1), 'USAGE'))::text, '0');
 
 insert into results (check_name, got, want)
-select r.role || ': ' || x.kind, x.n::text, '0'
-from (values ('zme_ws_zz_isol_a_read', 'ws_zz_isol_a'), ('zme_ws_zz_isol_a_write', 'ws_zz_isol_a'),
-             ('zme_ws_gateway', null)) as r(role, own),
-     lateral pg_temp.reach(r.role, r.own) x;
+select r.role || ': ' || x.kind, x.n::text,
+       case when r.role = 'zme_ws_caller' and x.kind = 'definer functions' then '2'   -- zme_ws.call, zme_ws_setup
+            else '0' end
+from (values ('zme_ws_zz_isol_a_read', '^ws_zz_isol_a$'), ('zme_ws_zz_isol_a_write', '^ws_zz_isol_a$'),
+             ('zme_ws_gateway', null), ('zme_ws_caller', null), ('zme_ws_owner', '^ws_')) as r(role, own),
+     lateral pg_temp.reach(r.role, r.own) x
+where not (r.role = 'zme_ws_owner' and x.kind in ('definer functions', 'schemas it can create in'));   -- it owns zme_ws and zme_ws.call
 
 select n, check_name, got, want,
        case when got = want or (want = 'denied*' and got like 'denied %') then 'ok' else 'FAIL' end as result

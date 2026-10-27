@@ -30,6 +30,8 @@ grant usage on schema extensions to zme_ws_owner, zme_ws_member;   -- vector typ
 create schema if not exists zme_ws authorization zme_ws_owner;
 revoke all on schema zme_ws from public;
 grant usage on schema zme_ws to zme_ws_member;
+-- The owner runs the cmd gateway (003) as a member of every workspace's write role, so forced RLS still applies to it.
+grant zme_ws_member to zme_ws_owner;
 
 -- Registry ----------------------------------------------------------------------------------------------------------
 
@@ -110,6 +112,7 @@ begin
   -- The gateway may switch to these roles but inherits nothing from them: without SET ROLE it can read nothing.
   execute format('grant %I, %I to zme_ws_gateway with inherit false, set true', rr, rw);
   execute format('grant %I, %I to postgres with inherit false, set true', rr, rw);   -- admin and tests
+  execute format('grant %I to zme_ws_owner', rw);                          -- cmd gateway (003); RLS still applies
 
   execute format('create schema if not exists %I authorization zme_ws_owner', s);
   execute format('revoke all on schema %I from public', s);
@@ -345,12 +348,25 @@ begin
   using p_limit;
 end $fn$;
 
+create or replace function zme_ws.stats(p_workspace text) returns jsonb
+language plpgsql stable set search_path = pg_catalog
+as $fn$
+declare s text := zme_ws._schema(p_workspace); r jsonb;
+begin
+  execute format($q$select jsonb_build_object(
+      'sources', (select count(*) from %1$I.sources),
+      'chunks', (select count(*) from %1$I.chunks),
+      'embedded', (select count(*) from %1$I.chunks where embedding_v is not null),
+      'last_added_at', (select max(created_at) from %1$I.sources))$q$, s) into r;
+  return r;
+end $fn$;
+
 -- Function privileges: nothing for PUBLIC; the API and RLS helpers for members; administration stays with postgres.
 revoke all on all functions in schema zme_ws from public;
 grant execute on function zme_ws.current_workspace(), zme_ws.tsquery(text), zme_ws._schema(text),
   zme_ws.search(text, extensions.vector, text, int, int, int, text[]),
   zme_ws.add_source(text, text, text, jsonb, text, text, jsonb),
-  zme_ws.fetch(text, uuid), zme_ws.sources(text, int)
+  zme_ws.fetch(text, uuid), zme_ws.sources(text, int), zme_ws.stats(text)
   to zme_ws_member;
 
 commit;

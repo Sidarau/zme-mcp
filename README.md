@@ -143,6 +143,8 @@ zk drop ecis --confirm ecis            # deletes the workspace and everything in
 
 Notes are chunked and embedded on write (ollama `snowflake-arctic-embed:335m`, the arctic-l space Zeug's memory uses), so they are searchable as soon as `add` returns. Without an embedding service, notes are stored without vectors and search uses the lexical arm.
 
+**cmd.zeuglab.com** reaches workspaces through the public ZME front door (PostgREST) with one JWT for role `zme_ws_caller` (`migrations/003_cmd_gateway.sql`, Zeug Keys `zeuglab/zeug-cmd/ZME_WS_JWT`, minted with the PostgREST secret, valid a year). That role can execute `public.zme_ws_call` (status, search, sources, fetch, add) and `public.zme_ws_setup` and nothing else; cmd passes the project, the access level and the person's email. Notes added from cmd have no vectors until `zme_ws.py embed-pending` runs on the tailnet; until then they are found by the lexical arm.
+
 Every role can read the catalog (table names, function bodies), so never put a secret in a function body.
 
 ## Development

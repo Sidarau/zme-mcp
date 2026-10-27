@@ -14,6 +14,7 @@ Commands:
   sources <id>                             newest sources in the workspace
   copy <id> <zeug-source-id> [--as EMAIL]  copy one source from Zeug's memory (owner only)
   drop <id> --confirm <id>                 delete the workspace and everything in it
+  embed-pending                            add vectors to chunks stored without one (run on the tailnet)
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ def main() -> int:
     so = sub.add_parser("sources"); so.add_argument("id")
     cp = sub.add_parser("copy"); cp.add_argument("id"); cp.add_argument("source_id"); cp.add_argument("--as", dest="actor")
     d = sub.add_parser("drop"); d.add_argument("id"); d.add_argument("--confirm", required=True)
+    sub.add_parser("embed-pending")
     args = ap.parse_args()
 
     ws = Workspaces()
@@ -64,6 +66,8 @@ def main() -> int:
         show(ws.sources(args.id))
     elif args.cmd == "copy":
         print(ws.copy_from_zeug(args.id, args.source_id, actor=args.actor))
+    elif args.cmd == "embed-pending":
+        show(ws.embed_pending())
     elif args.cmd == "drop":
         ws.drop(args.id, args.confirm)
         print(f"dropped {args.id}")
