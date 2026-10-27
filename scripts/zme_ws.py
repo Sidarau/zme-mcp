@@ -84,6 +84,7 @@ def main() -> int:
         from zme_mcp.share import digest, prepare, preview, publish, scan
         titles = dict(x.split("=", 1) for x in args.title)
         approvals = dict(x.split("=", 1) for x in args.approve)
+        outcomes: list[tuple[str, str]] = []   # (source, status) for every publication asked for
         for s in scan(ws, args.id, args.sources, args.mask):
             mode = "redacted" if s.source_id in args.redact else "as-is" if s.source_id in args.accept else None
             state = mode or ("not approved" if not s.flags else "held")
@@ -98,6 +99,8 @@ def main() -> int:
                 payload = prepare(s, args.id, mode, args.mask, titles.get(s.source_id))
             except ValueError as e:
                 print(f"   held: {e}")
+                if args.publish:
+                    outcomes.append((s.source_id, f"held: {e}"))
                 continue
             if args.preview:
                 print(f"   --- {mode} payload ---")
@@ -106,6 +109,15 @@ def main() -> int:
             if args.publish:
                 status, new_id = publish(ws, args.id, s, mode, args.actor, payload, approvals.get(s.source_id))
                 print(f"   {status}{' as ' + new_id if new_id else ''}")
+                outcomes.append((s.source_id, status))
+        if args.publish:
+            done = [x for x in outcomes if x[1] in ("published", "already shared")]
+            print(f"\npublished or already shared: {len(done)} of {len(outcomes)}")
+            if len(done) < len(outcomes):
+                for sid, status in outcomes:
+                    if (sid, status) not in done:
+                        print(f"   not published: {sid}: {status}")
+                return 1   # earlier sources in this run may have committed; they are listed above
     elif args.cmd == "shares":
         with __import__("psycopg").connect(ws.dsn) as conn:
             show([dict(zip(("source", "copy", "mode", "flags", "by", "at"), r)) for r in conn.execute(

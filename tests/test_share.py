@@ -146,3 +146,37 @@ for ok in ["The HTML markup includes accessible labels", "Authentication is pass
            "token_count: 512 per chunk", "Tokens: 500 used"]:
     assert not flagged(ok), ok
 print("share tests (round 3): all passed")
+
+# --- Codex round 4 ---------------------------------------------------------------------------------------------
+# copied vectors are bound to the approval
+mk = lambda emb: Snapshot("s10", "T", "note", None, "text", [{"chunk_index": 0, "content": "c", "context_prefix": None, "heading": None,  # noqa: E731
+                                                              "token_count": 1, "embedding": emb, "embed_variant": "arctic-l-v1", "chunker_version": "md-h+window-v1"}])
+assert digest(P, "as-is", prepare(Scan(mk("[0.1,0.2]"), []), P, "as-is")) != digest(P, "as-is", prepare(Scan(mk("[0.1,0.3]"), []), P, "as-is"))
+# credential continuations
+for text, secret in [("keep\npassword: | # credential\n  synthetic-secret\nafter", "synthetic-secret"),
+                     ("keep\npassword: |2\n  synthetic-secret\nafter", "synthetic-secret"),
+                     ("keep\r\npassword: |\r\n  synthetic-secret\r\nafter", "synthetic-secret"),
+                     ("keep\napi_key:\n  synthetic-secret\nafter", "synthetic-secret"),
+                     ("keep\nexport TOKEN=abc\\\ncontinued-secret\nafter", "continued-secret")]:
+    assert flagged(text), text
+    out = redact(text, P)
+    assert secret not in out and "keep" in out and "after" in out, (text, out)
+# names with suffixes and compact code assignments
+for line in ["API_KEY_PROD=synthetic-secret", "PASSWORD_PROD: synthetic-secret", "Gate code=482915", "Door code:482915",
+             "authorization: bearer abcdef1234567890", "Authorization: Basic dXNlcjpwYXNzd29yZA=="]:
+    assert flagged(line), line
+    assert "synthetic-secret" not in redact(line, P) and "482915" not in redact(line, P), line
+assert "abcdef1234567890" not in redact("authorization: bearer abcdef1234567890", P)
+# ambiguous paths
+for line in ["keep\n/Users/alex/Acme _Bankruptcy Case/settlement.xlsx\nafter", "keep\n/Users/alex/Client's Private Files/x.xlsx\nafter",
+             'keep\nsee "/Users/alex/Acme Bankruptcy Case/settlement.xlsx\nafter']:
+    out = redact(line, P)
+    assert "Bankruptcy" not in out and "Private Files" not in out and out == "keep\nafter", (line, out)
+# phone numbers never eat the next line
+assert redact("Call +14155551212\n2026 roadmap approved", P) == "Call [removed]\n2026 roadmap approved"
+# masks reach technical fields
+pay = prepare(Scan(mk("[0.1]"), []), P, "as-is", ["md-h+window-v1", "note"])
+assert pay["chunks"][0]["chunker_version"] is None and pay["source_type"] == "document", pay
+print("share tests (round 4): all passed")
+assert not flagged("an eligible connection and a basic national/regional application")
+print("share tests (round 4 follow-up): all passed")

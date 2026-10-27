@@ -43,25 +43,33 @@ CHUNKERS = {"md-h+window-v1"}                           # known chunker versions
 MASK, DROP = "mask", "drop"   # MASK: the match is replaced in place. DROP: every line the match touches goes.
 _ = re.compile
 _PATH_START = r"(?:file://|~[/\\]|/(?:Users|home|tmp|private|var|opt|etc|Volumes|mnt|root)/|[A-Za-z]:\\|\\\\)"
-# Credential names end at the keyword (with an optional short suffix): DB_PASSWORD, client_secret, AWS_SECRET_ACCESS_KEY,
-# but not passwordless or token_count.
+# Credential names end at the keyword, optionally followed by a suffix word (DB_PASSWORD, client_secret,
+# AWS_SECRET_ACCESS_KEY, API_KEY_PROD), but not counters or adjectives (token_count, passwordless).
 _CRED_NAME = (r"""["']?\b[\w-]*?(?:password|passwd|passcode|secret|token|api[_ -]?key|access[_ -]?(?:code|key)"""
-              r"""|private[_ -]?key|client[_ -]?secret|credentials?)(?:[_-]?(?:value|id|key))?\b["']?""")
-# A value: quoted (escapes and newlines allowed; unterminated runs to the end), a YAML block (| or >) with its indented
-# lines, or a single token.
+              r"""|private[_ -]?key|client[_ -]?secret|credentials?)(?:[_-](?!count\b|counts\b|limit\b|usage\b|budget\b)[A-Za-z0-9]+)*\b["']?""")
+# A value: quoted (escapes and newlines allowed; unterminated runs to the end); a YAML block (| or > with optional
+# indent/chomping digits and a comment) or an empty value, each with every indented line after it; a shell
+# continuation (lines ending in a backslash); or a single token.
+_NL = r"\r?\n"
+_INDENTED = r"(?:" + _NL + r"(?:[ \t]+\S[^\r\n]*|[ \t]*)(?=\r?\n|\Z))*"
 _CRED_VALUE = (r"""(?:"(?:[^"\\]|\\[\s\S])*(?:"|\Z)|'(?:[^'\\]|\\[\s\S])*(?:'|\Z)"""
-               r"""|[|>][-+]?[ \t]*(?:\n(?:[ \t]+\S[^\n]*|[ \t]*)(?=\n|\Z))*|\S+)""")
+               r"""|[|>][-+0-9]*[ \t]*(?:#[^\r\n]*)?""" + _INDENTED +
+               r"""|(?=""" + _NL + r"""[ \t]+\S)""" + _INDENTED +
+               r"""|(?:[^\s\\]*\\""" + _NL + r""")+[^\r\n]*|\S+)""")
 RULES: list[tuple[str, str, re.Pattern[str]]] = [
     ("key or token", MASK, _(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
                              r"|sk-[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abposr]-[A-Za-z0-9-]+"
                              r"|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
-                             r"|\bBearer\s+[A-Za-z0-9._~+/=-]{12,}")),
+                             # An authorization value has digits or base64 padding, unlike "basic national/regional".
+                             r"|\b(?i:bearer|basic)[ \t]+(?=[A-Za-z0-9._~+/=-]*[0-9=])[A-Za-z0-9._~+/=-]{12,}")),
     ("access code", MASK, _(r"\((?:access\s+)?code:?\s+[^)\n]+\)", re.I)),
     ("credential", DROP, _(_CRED_NAME + r"[ \t]*(?:[:=]|\bis\b)[ \t]*" + _CRED_VALUE, re.I)),
-    ("access code", DROP, _(r"\b(?:access code|passcode|pin code|door code|gate code|wi-?fi password)\b(?:[ \t]*(?:is|[:=]))?[ \t]+\S+", re.I)),
+    ("access code", DROP, _(r"\b(?:access code|passcode|pin code|door code|gate code|wi-?fi password)\b"
+                            r"(?:[ \t]*(?:is|[:=])[ \t]*\S+|[ \t]+\S+)", re.I)),
     ("email", MASK, _(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
-    ("phone", MASK, _(r"(?<![\w+])\+\d{1,3}[\s.-]?(?:\(\d{1,4}\)[\s.-]?)?\d[\d\s.-]{6,}\d|\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]\d{4}\b"
-                      r"|\(\d{3}\)\s?\d{7}\b|(?<![\w.,+-])\d{10,11}(?![\w.,])")),
+    # Phone numbers stay on one line and have a bounded length, so they never swallow the next line's digits.
+    ("phone", MASK, _(r"(?<![\w+])\+\d{1,3}[ \t.-]?(?:\(\d{1,4}\)[ \t.-]?)?\d(?:[ \t.-]?\d){6,12}(?!\d)"
+                      r"|\(?\b\d{3}\)?[ \t.-]?\d{3}[ \t.-]\d{4}\b|\(\d{3}\)[ \t]?\d{7}\b|(?<![\w.,+-])\d{10,11}(?![\w.,])")),
     # Quoted paths, each delimiter on its own (a double-quoted path may contain an apostrophe).
     ("local path", MASK, _(r'"' + _PATH_START + r'[^"\n]*"' + r"|'" + _PATH_START + r"[^'\n]*'")),
     ("marked internal", DROP, _(r"\b(internal only|do not share|don'?t share|confidential|private note|zeug[- ]only)\b", re.I)),
@@ -72,9 +80,10 @@ RULES: list[tuple[str, str, re.Pattern[str]]] = [
     ("assessment of a person", DROP, _(r"\b(background check|evidence comparison|contribution audit|trust posture)\b", re.I)),
     ("personal data", DROP, _(r"\b(birthday|date of birth|DOB|born on|passport|home address|SSN)\b", re.I)),
 ]
-# Unquoted local paths and file URIs: masked when nothing follows on the line but punctuation; when another word follows,
-# the path may continue with spaces, its end is unknown, and the line goes.
-UNQUOTED_PATH = _(r"""(?<![\w/.:"'])""" + _PATH_START + r"""[^\s"'<>)\]]*""")
+# Unquoted local paths and file URIs (including one after an unmatched quote): masked only when nothing but punctuation
+# follows on the line; otherwise the path may continue (spaces, apostrophes), its end is unknown, and the line goes.
+UNQUOTED_PATH = _(r"""(?<![\w/.:])""" + _PATH_START + r"""[^\s"'<>)\]]*""")
+_ENDS_CLEARLY = _(r"""[.,;:!?)\]}"']*[ \t]*(?:\r?\n|\Z)""")
 
 
 @dataclass
@@ -111,8 +120,11 @@ def _spans(text: str, project: str, extra: list[str]) -> list[tuple[int, int, st
     out: list[tuple[int, int, str, str]] = []
     for reason, action, rx in RULES:
         out += [(*m.span(), reason, action) for m in rx.finditer(text)]
+    quoted = [(s, e) for s, e, reason, _a in out if reason == "local path"]   # complete quoted paths, already masked
     for m in UNQUOTED_PATH.finditer(text):
-        ends_clearly = not re.match(r"[ \t]+[A-Za-z0-9]", text[m.end():])
+        if any(s <= m.start() < e for s, e in quoted):
+            continue
+        ends_clearly = _ENDS_CLEARLY.match(text, m.end()) is not None
         out.append((*m.span(), "local path", MASK if ends_clearly else DROP))
     own = {n.lower() for n in OWN_NAMES.get(project, [])}
     others = [c for c in CLIENTS if c.lower() not in own]
@@ -231,7 +243,10 @@ def scan(ws, project: str, source_ids: list[str], extra: list[str] | None = None
 def prepare(s: Scan, project: str, mode: str, extra: list[str] | None = None, title: str | None = None) -> dict:
     """The exact payload that would be published (what --preview prints and what the digest covers)."""
     snap = s.snap
+    masked = lambda value: bool(value) and any(w.lower() in value.lower() for w in extra or [])  # noqa: E731
     kind = source_type(snap.source_type)
+    if masked(kind):
+        kind = "document"
     url = clean_url(snap.url)
     if url and _url_flags(project, url, extra):
         url = None
@@ -244,6 +259,8 @@ def prepare(s: Scan, project: str, mode: str, extra: list[str] | None = None, ti
                 "chunk_index": int(c["chunk_index"]), "content": c["content"], "context_prefix": c.get("context_prefix"),
                 "heading": c.get("heading"), "token_count": int(c["token_count"]) if c.get("token_count") is not None else None,
                 "embedding": c["embedding"] if ok_vector else None, "embed_variant": c["embed_variant"] if ok_vector else None,
+                # Copied vectors are bound to the approval by checksum (they are not derived from the preview).
+                "vector_sha": hashlib.sha256(c["embedding"].encode()).hexdigest()[:12] if ok_vector else None,
                 "chunker_version": c["chunker_version"] if c.get("chunker_version") in CHUNKERS else None,
             })
     elif mode == "redacted":
@@ -264,6 +281,9 @@ def prepare(s: Scan, project: str, mode: str, extra: list[str] | None = None, ti
             c["embed_variant"] = EMBED_VARIANT if v else None
     else:
         raise ValueError("mode must be as-is or redacted")
+    for c in chunks:
+        if masked(c.get("chunker_version")):
+            c["chunker_version"] = None
     return {"title": new_title[:300], "text": text, "url": url, "source_type": kind, "chunks": chunks}
 
 
@@ -274,17 +294,19 @@ def preview(payload: dict) -> str:
     for c in payload["chunks"]:
         out.append(f"chunk {c['chunk_index']}: heading={c.get('heading')!r} prefix={c.get('context_prefix')!r} "
                    f"tokens={c.get('token_count')!r} chunker={c.get('chunker_version')!r} "
-                   f"vector={c.get('embed_variant') if c.get('embedding') else 'none'}")
+                   f"vector={c.get('embed_variant') if c.get('embedding') else 'none'}"
+                   + (f" sha={c['vector_sha']}" if c.get("vector_sha") else ""))
         out += ["  | " + line for line in c["content"].splitlines()]
     return "\n".join(out)
 
 
 def digest(project: str, mode: str, payload: dict) -> str:
-    """Fingerprint of everything an approval covers: destination, mode and every outgoing field except the vectors
-    (they are derived from the content and the allowlisted variant). Publication refuses any other payload."""
+    """Fingerprint of everything an approval covers: destination, mode, every outgoing field, and the checksum of each
+    copied vector. Vectors regenerated while redacting are computed from the previewed content and left out, since
+    the embedding service need not reproduce them bit for bit. Publication refuses any other payload."""
     body = {"project": project, "mode": mode, **{k: payload[k] for k in ("title", "text", "url", "source_type")},
             "chunks": [{k: c.get(k) for k in ("chunk_index", "content", "context_prefix", "heading", "token_count",
-                                              "chunker_version", "embed_variant")} for c in payload["chunks"]]}
+                                              "chunker_version", "embed_variant", "vector_sha")} for c in payload["chunks"]]}
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
