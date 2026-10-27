@@ -15,6 +15,11 @@ Commands:
   copy <id> <zeug-source-id> [--as EMAIL]  copy one source from Zeug's memory (owner only)
   drop <id> --confirm <id>                 delete the workspace and everything in it
   embed-pending                            add vectors to chunks stored without one (run on the tailnet)
+  share <id> <zeug-source-id>... [--preview] [--publish] [--accept SRC ...] [--redact SRC ...] [--mask WORD ...]
+        [--title SRC=TITLE ...] [--approve SRC=DIGEST ...] --as EMAIL
+                                           scan; --preview prints every outgoing field and a digest; --publish writes
+                                           only named sources whose payload still matches the approved digest
+  shares <id>                              what was shared into the workspace, by whom and how
 """
 from __future__ import annotations
 
@@ -45,6 +50,14 @@ def main() -> int:
     cp = sub.add_parser("copy"); cp.add_argument("id"); cp.add_argument("source_id"); cp.add_argument("--as", dest="actor")
     d = sub.add_parser("drop"); d.add_argument("id"); d.add_argument("--confirm", required=True)
     sub.add_parser("embed-pending")
+    sh = sub.add_parser("share"); sh.add_argument("id"); sh.add_argument("sources", nargs="+")
+    sh.add_argument("--publish", action="store_true"); sh.add_argument("--accept", nargs="*", default=[])
+    sh.add_argument("--redact", nargs="*", default=[]); sh.add_argument("--as", dest="actor", required=True)
+    sh.add_argument("--mask", nargs="*", default=[], help="extra literals to flag and remove (never committed)")
+    sh.add_argument("--title", nargs="*", default=[], help="SRC=replacement title, when the title itself is flagged")
+    sh.add_argument("--preview", action="store_true", help="print the exact payload that would be published")
+    sh.add_argument("--approve", nargs="*", default=[], help="SRC=DIGEST printed by --preview; publication needs it")
+    shs = sub.add_parser("shares"); shs.add_argument("id")
     args = ap.parse_args()
 
     ws = Workspaces()
@@ -66,6 +79,50 @@ def main() -> int:
         show(ws.sources(args.id))
     elif args.cmd == "copy":
         print(ws.copy_from_zeug(args.id, args.source_id, actor=args.actor))
+    elif args.cmd == "share":
+        # Nothing publishes unless it is named in --accept (as is) or --redact; a clean scan is not approval.
+        from zme_mcp.share import digest, prepare, preview, publish, scan
+        titles = dict(x.split("=", 1) for x in args.title)
+        approvals = dict(x.split("=", 1) for x in args.approve)
+        outcomes: list[tuple[str, str]] = []   # (source, status) for every publication asked for
+        for s in scan(ws, args.id, args.sources, args.mask):
+            mode = "redacted" if s.source_id in args.redact else "as-is" if s.source_id in args.accept else None
+            state = mode or ("not approved" if not s.flags else "held")
+            print(f"\n{s.source_id}  {s.snap.title}  [{s.snap.source_type}, {len(s.snap.text)} chars]  flags: {len(s.flags)}  -> {state}")
+            for f in s.flags[:15]:
+                print(f"   {f.where} line {f.line}: {f.reason} ({f.action}): {f.text}")
+            if len(s.flags) > 15:
+                print(f"   ... {len(s.flags) - 15} more")
+            if not mode or not (args.publish or args.preview):
+                continue
+            try:
+                payload = prepare(s, args.id, mode, args.mask, titles.get(s.source_id))
+            except ValueError as e:
+                print(f"   held: {e}")
+                if args.publish:
+                    outcomes.append((s.source_id, f"held: {e}"))
+                continue
+            if args.preview:
+                print(f"   --- {mode} payload ---")
+                print("\n".join("   " + line for line in preview(payload).splitlines()))
+                print(f"   to publish exactly this: --approve {s.source_id}={digest(args.id, mode, payload)}")
+            if args.publish:
+                status, new_id = publish(ws, args.id, s, mode, args.actor, payload, approvals.get(s.source_id))
+                print(f"   {status}{' as ' + new_id if new_id else ''}")
+                outcomes.append((s.source_id, status))
+        if args.publish:
+            done = [x for x in outcomes if x[1] in ("published", "already shared")]
+            print(f"\npublished or already shared: {len(done)} of {len(outcomes)}")
+            if len(done) < len(outcomes):
+                for sid, status in outcomes:
+                    if (sid, status) not in done:
+                        print(f"   not published: {sid}: {status}")
+                return 1   # earlier sources in this run may have committed; they are listed above
+    elif args.cmd == "shares":
+        with __import__("psycopg").connect(ws.dsn) as conn:
+            show([dict(zip(("source", "copy", "mode", "flags", "by", "at"), r)) for r in conn.execute(
+                "select zeug_source_id, workspace_source_id, mode, flags, shared_by, shared_at from zme_ws.shares where workspace = %s order by shared_at",
+                (args.id,)).fetchall()])
     elif args.cmd == "embed-pending":
         show(ws.embed_pending())
     elif args.cmd == "drop":

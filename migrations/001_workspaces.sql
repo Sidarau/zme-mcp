@@ -49,6 +49,23 @@ alter table zme_ws.workspaces force row level security;
 revoke all on zme_ws.workspaces from public;
 grant select on zme_ws.workspaces to zme_ws_member;
 
+-- What was shared from Zeug's memory into which workspace, by whom and how (src/zme_mcp/share.py). Admin only.
+create table if not exists zme_ws.shares (
+  id                  bigint generated always as identity primary key,
+  workspace           text not null references zme_ws.workspaces(id) on delete cascade,
+  zeug_source_id      uuid not null,
+  workspace_source_id uuid not null,
+  mode                text not null check (mode in ('as-is', 'redacted')),
+  flags               int not null,
+  shared_by           text not null,
+  shared_at           timestamptz not null default now()
+);
+create unique index if not exists shares_once on zme_ws.shares (workspace, zeug_source_id);   -- one share per source
+alter table zme_ws.shares owner to zme_ws_owner;
+alter table zme_ws.shares enable row level security;
+alter table zme_ws.shares force row level security;
+revoke all on zme_ws.shares from public;
+
 -- Helpers -------------------------------------------------------------------------------------------------------------
 
 create or replace function zme_ws.current_workspace() returns text
