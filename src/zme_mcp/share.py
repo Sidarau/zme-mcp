@@ -2,17 +2,18 @@
 
 Zeug's memory is internal by default. Nothing reaches a client workspace unless someone runs `share` for named
 sources and a named project, previews them, and approves each one by id: `--accept` (publish as is, vectors
-included) or `--redact` (publish a redacted copy). A clean scan never publishes on its own.
+included) or `--redact` (publish a redacted copy), plus `--approve id=<digest>` with the digest the preview printed.
+A clean scan never publishes on its own, and a payload that changed after its preview is refused.
 
-Each source is read once into a snapshot, and the snapshot is what gets scanned, previewed and published: URL,
-type, title, text, and for an as-is copy every chunk's content, prefix and heading. The scan flags lines that look
-internal (another client, a negotiating position, ownership or Zeug-finance talk, an assessment of a person,
-personal data, credentials and access codes, keys, contact details, local paths, and any literal the operator asks
-to mask). Redaction replaces spans with a known extent in place and drops every other flagged line, including a
-credential whose value runs across lines and a path whose extent is unclear; then it re-chunks and re-embeds.
-URLs cross only as plain http(s) without credentials, query or fragment, and only when nothing in them is flagged.
-Technical chunk fields are rebuilt or checked against an allowlist. The insert and its audit row (zme_ws.shares)
-commit together under a per-source lock, and a source already shared into a workspace is skipped.
+Each source is read once into a snapshot, and the snapshot is what gets scanned, previewed and published: URL (as
+written and percent-decoded), type, title, text, and for an as-is copy every chunk's content, prefix and heading.
+The scan flags lines that look internal (another client, a negotiating position, ownership or Zeug-finance talk, an
+assessment of a person, personal data, credentials, access codes, keys, contact details, local paths, and any
+literal the operator asks to mask). Redaction replaces spans with a known extent in place and drops every other
+flagged line, including a credential whose value runs across lines and a path whose end is unclear; then it
+re-chunks and re-embeds. URLs cross only as plain http(s) without credentials, query or fragment, and only when
+nothing in them is flagged. Technical chunk fields are rebuilt or allowlisted, and shown in the preview. The insert
+and its audit row (zme_ws.shares) commit together under a per-source lock; a source already shared is skipped.
 
 The scan is a tripwire, not a judge. Preview everything and read it before approving.
 """
@@ -22,7 +23,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .text import EMBED_VARIANT, _vector, chunk, embed
 
@@ -37,33 +38,43 @@ CLIENTS = ["Try Day Club", "TDC", "ChartClose", "Clearwell", "Mitchel", "Mitchie
            "Nexwave", "Sketchy"]
 TYPES = {"note", "article", "analysis", "document", "transcript", "research", "compiled_research", "social"}
 VARIANTS = {"arctic-l-v1", "arctic-335m-v1"}            # vectors in the arctic-l space; any other variant is dropped
-TECH_RE = re.compile(r"^[A-Za-z0-9.+_-]{1,40}$")
+CHUNKERS = {"md-h+window-v1"}                           # known chunker versions; anything else is dropped
 
 MASK, DROP = "mask", "drop"   # MASK: the match is replaced in place. DROP: every line the match touches goes.
 _ = re.compile
-_CRED_NAME = r"""["']?\b[\w-]*(?:password|passwd|passcode|secret|token|api[_ -]?key|access[_ -]?(?:code|key)|private[_ -]?key|client[_ -]?secret|credentials?)[\w-]*\b["']?"""
+_PATH_START = r"(?:file://|~[/\\]|/(?:Users|home|tmp|private|var|opt|etc|Volumes|mnt|root)/|[A-Za-z]:\\|\\\\)"
+# Credential names end at the keyword (with an optional short suffix): DB_PASSWORD, client_secret, AWS_SECRET_ACCESS_KEY,
+# but not passwordless or token_count.
+_CRED_NAME = (r"""["']?\b[\w-]*?(?:password|passwd|passcode|secret|token|api[_ -]?key|access[_ -]?(?:code|key)"""
+              r"""|private[_ -]?key|client[_ -]?secret|credentials?)(?:[_-]?(?:value|id|key))?\b["']?""")
+# A value: quoted (escapes and newlines allowed; unterminated runs to the end), a YAML block (| or >) with its indented
+# lines, or a single token.
+_CRED_VALUE = (r"""(?:"(?:[^"\\]|\\[\s\S])*(?:"|\Z)|'(?:[^'\\]|\\[\s\S])*(?:'|\Z)"""
+               r"""|[|>][-+]?[ \t]*(?:\n(?:[ \t]+\S[^\n]*|[ \t]*)(?=\n|\Z))*|\S+)""")
 RULES: list[tuple[str, str, re.Pattern[str]]] = [
     ("key or token", MASK, _(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
                              r"|sk-[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abposr]-[A-Za-z0-9-]+"
-                             r"|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")),
+                             r"|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
+                             r"|\bBearer\s+[A-Za-z0-9._~+/=-]{12,}")),
     ("access code", MASK, _(r"\((?:access\s+)?code:?\s+[^)\n]+\)", re.I)),
-    # A credential assignment: a quoted value may run across lines (unterminated: to the end), so every line it touches goes.
-    ("credential", DROP, _(_CRED_NAME + r"""\s*(?:[:=]|\bis\b)\s*(?:"(?:[^"\\]|\\.)*(?:"|\Z)|'(?:[^'\\]|\\.)*(?:'|\Z)|\S+)""", re.I)),
-    ("access code", DROP, _(r"\b(?:access code|passcode|pin code|door code|gate code|wi-?fi password)\b\W{0,3}(?:[A-Za-z]+\W{1,3}){0,3}?[A-Za-z0-9-]*\d[A-Za-z0-9-]*", re.I)),
+    ("credential", DROP, _(_CRED_NAME + r"[ \t]*(?:[:=]|\bis\b)[ \t]*" + _CRED_VALUE, re.I)),
+    ("access code", DROP, _(r"\b(?:access code|passcode|pin code|door code|gate code|wi-?fi password)\b(?:[ \t]*(?:is|[:=]))?[ \t]+\S+", re.I)),
     ("email", MASK, _(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     ("phone", MASK, _(r"(?<![\w+])\+\d{1,3}[\s.-]?(?:\(\d{1,4}\)[\s.-]?)?\d[\d\s.-]{6,}\d|\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]\d{4}\b"
-                      r"|(?<![\w.,+-])\d{10,11}(?![\w.,])")),
-    ("local path", MASK, _(r"""file://\S+|(["'])(?:~[/\\]|/(?:Users|home|tmp|private|var|opt|etc|Volumes|mnt|root)/|[A-Za-z]:\\|\\\\)[^"'\n]*\1""")),
+                      r"|\(\d{3}\)\s?\d{7}\b|(?<![\w.,+-])\d{10,11}(?![\w.,])")),
+    # Quoted paths, each delimiter on its own (a double-quoted path may contain an apostrophe).
+    ("local path", MASK, _(r'"' + _PATH_START + r'[^"\n]*"' + r"|'" + _PATH_START + r"[^'\n]*'")),
     ("marked internal", DROP, _(r"\b(internal only|do not share|don'?t share|confidential|private note|zeug[- ]only)\b", re.I)),
-    ("negotiating position", DROP, _(r"\b(walk[- ]?away|our floor|floor of|bottom line|leverage over|negotiat\w*|bluff|our margin|markup)\b", re.I)),
+    ("negotiating position", DROP, _(r"\b(walk[- ]?away|our floor|floor of|bottom line|leverage over|negotiat\w*|bluff|our margin|our markup)\b", re.I)),
     ("ownership or equity", DROP, _(r"\b(equity|cap table|vesting|dilution|founder parameters?)\b|\b\d+(?:\.\d+)?\s*%\s*(?:equity|ownership|stake|of the company)\b"
                                     r"|\b(?:ownership|equity)\s+(?:split|stake|percentage|share)\b", re.I)),
     ("Zeug finances", DROP, _(r"\b(our revenue|zeug(?: lab)?'?s? (?:revenue|runway|cash|pricing)|runway|burn rate|\$10k/mo)\b", re.I)),
     ("assessment of a person", DROP, _(r"\b(background check|evidence comparison|contribution audit|trust posture)\b", re.I)),
     ("personal data", DROP, _(r"\b(birthday|date of birth|DOB|born on|passport|home address|SSN)\b", re.I)),
 ]
-# Unquoted local paths: masked when their end is clear, otherwise the line goes (a path with spaces can't be bounded).
-UNQUOTED_PATH = _(r"""(?<![\w/.:"'])(?:~[/\\]|/(?:Users|home|tmp|private|var|opt|etc|Volumes|mnt|root)/|\b[A-Za-z]:\\|\\\\[^\s"'<>\\]+\\)[^\s"'<>)\]]*""")
+# Unquoted local paths and file URIs: masked when nothing follows on the line but punctuation; when another word follows,
+# the path may continue with spaces, its end is unknown, and the line goes.
+UNQUOTED_PATH = _(r"""(?<![\w/.:"'])""" + _PATH_START + r"""[^\s"'<>)\]]*""")
 
 
 @dataclass
@@ -101,8 +112,7 @@ def _spans(text: str, project: str, extra: list[str]) -> list[tuple[int, int, st
     for reason, action, rx in RULES:
         out += [(*m.span(), reason, action) for m in rx.finditer(text)]
     for m in UNQUOTED_PATH.finditer(text):
-        last = re.split(r"[/\\]", m.group(0).rstrip("/\\"))[-1]
-        ends_clearly = "." in last or not re.match(r" +[A-Za-z0-9]", text[m.end():])
+        ends_clearly = not re.match(r"[ \t]+[A-Za-z0-9]", text[m.end():])
         out.append((*m.span(), "local path", MASK if ends_clearly else DROP))
     own = {n.lower() for n in OWN_NAMES.get(project, [])}
     others = [c for c in CLIENTS if c.lower() not in own]
@@ -172,6 +182,13 @@ def source_type(kind: str | None) -> str:
     return kind if kind in TYPES else "document"
 
 
+def _url_flags(project: str, url: str | None, extra: list[str] | None) -> list[Flag]:
+    """A URL is checked as written and percent-decoded, so encoding cannot hide a mask or a sensitive form."""
+    if not url:
+        return []
+    return scan_text(project, url, "url", extra) + scan_text(project, unquote(url), "url (decoded)", extra)
+
+
 def snapshot(conn, source_id: str) -> Snapshot:
     row = conn.execute("select title, source_type, url, raw_content from public.sources where id = %s", (source_id,)).fetchone()
     if not row:
@@ -187,7 +204,7 @@ def snapshot(conn, source_id: str) -> Snapshot:
 
 def scan_snapshot(project: str, snap: Snapshot, extra: list[str] | None = None) -> list[Flag]:
     """Flags for everything that could leave: URL, type, title, text, and every chunk field an as-is copy carries."""
-    flags = scan_text(project, snap.url or "", "url", extra) + scan_text(project, snap.source_type, "source type", extra)
+    flags = _url_flags(project, snap.url, extra) + scan_text(project, snap.source_type, "source type", extra)
     flags += scan_text(project, snap.title, "title", extra) + scan_text(project, snap.text, "text", extra)
     for c in snap.chunks:
         for fld in ("content", "context_prefix", "heading"):
@@ -212,11 +229,11 @@ def scan(ws, project: str, source_ids: list[str], extra: list[str] | None = None
 
 
 def prepare(s: Scan, project: str, mode: str, extra: list[str] | None = None, title: str | None = None) -> dict:
-    """The exact payload that would be published (what --preview prints)."""
+    """The exact payload that would be published (what --preview prints and what the digest covers)."""
     snap = s.snap
     kind = source_type(snap.source_type)
     url = clean_url(snap.url)
-    if url and scan_text(project, url, "url", extra):
+    if url and _url_flags(project, url, extra):
         url = None
     if mode == "as-is":
         new_title, text = snap.title, snap.text
@@ -227,11 +244,16 @@ def prepare(s: Scan, project: str, mode: str, extra: list[str] | None = None, ti
                 "chunk_index": int(c["chunk_index"]), "content": c["content"], "context_prefix": c.get("context_prefix"),
                 "heading": c.get("heading"), "token_count": int(c["token_count"]) if c.get("token_count") is not None else None,
                 "embedding": c["embedding"] if ok_vector else None, "embed_variant": c["embed_variant"] if ok_vector else None,
-                "chunker_version": c["chunker_version"] if c.get("chunker_version") and TECH_RE.match(c["chunker_version"]) else None,
+                "chunker_version": c["chunker_version"] if c.get("chunker_version") in CHUNKERS else None,
             })
     elif mode == "redacted":
-        title_dropped = any(f.where == "title" and f.action == DROP for f in s.flags)
-        new_title = (title or ("" if title_dropped else redact(snap.title, project, extra))).strip()
+        if title is not None:   # a replacement title is checked like any title
+            if any(f.action == DROP for f in scan_text(project, title, "title", extra)):
+                raise ValueError("the replacement title is flagged too; choose another")
+            new_title = redact(title, project, extra).strip()
+        else:
+            title_dropped = any(f.where == "title" and f.action == DROP for f in s.flags)
+            new_title = "" if title_dropped else redact(snap.title, project, extra).strip()
         if not new_title:
             raise ValueError(f"the title is flagged; give a replacement with --title {snap.source_id}=...")
         text = redact(snap.text, project, extra)
@@ -246,18 +268,31 @@ def prepare(s: Scan, project: str, mode: str, extra: list[str] | None = None, ti
 
 
 def preview(payload: dict) -> str:
-    """Every outgoing text field, as it would be written."""
+    """Every outgoing field, as it would be written."""
     out = [f"title: {payload['title']}", f"url: {payload['url']}", f"type: {payload['source_type']}", "text:"]
     out += ["  | " + line for line in payload["text"].splitlines()]
     for c in payload["chunks"]:
         out.append(f"chunk {c['chunk_index']}: heading={c.get('heading')!r} prefix={c.get('context_prefix')!r} "
-                   f"vector={'yes' if c.get('embedding') else 'no'}")
+                   f"tokens={c.get('token_count')!r} chunker={c.get('chunker_version')!r} "
+                   f"vector={c.get('embed_variant') if c.get('embedding') else 'none'}")
         out += ["  | " + line for line in c["content"].splitlines()]
     return "\n".join(out)
 
 
-def publish(ws, project: str, s: Scan, mode: str, actor: str, payload: dict) -> tuple[str, str]:
-    """Inserts the prepared payload and its audit row in one transaction, under a per-source lock."""
+def digest(project: str, mode: str, payload: dict) -> str:
+    """Fingerprint of everything an approval covers: destination, mode and every outgoing field except the vectors
+    (they are derived from the content and the allowlisted variant). Publication refuses any other payload."""
+    body = {"project": project, "mode": mode, **{k: payload[k] for k in ("title", "text", "url", "source_type")},
+            "chunks": [{k: c.get(k) for k in ("chunk_index", "content", "context_prefix", "heading", "token_count",
+                                              "chunker_version", "embed_variant")} for c in payload["chunks"]]}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def publish(ws, project: str, s: Scan, mode: str, actor: str, payload: dict, approved: str | None) -> tuple[str, str]:
+    """Inserts the prepared payload and its audit row in one transaction, under a per-source lock, but only when
+    `approved` is the digest of exactly this payload (printed by --preview)."""
+    if approved != digest(project, mode, payload):
+        return "refused: not previewed, or changed since the preview; preview again and approve the new digest", ""
     import psycopg
     from psycopg import sql
     from psycopg.rows import dict_row

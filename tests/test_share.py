@@ -83,7 +83,7 @@ out = redact('see "/Users/alex/Acme Bankruptcy Case/settlement.xlsx" now', P)
 assert "Bankruptcy" not in out and "settlement" not in out and out.startswith("see"), out
 out = redact("keep\nopen /Users/alex/Acme Bankruptcy Case/settlement.xlsx now\nkeep too", P)
 assert "Bankruptcy" not in out and out == "keep\nkeep too", out
-assert redact("file at /tmp/oc_model_v2.py was used", P) == "file at [removed] was used"
+assert redact("file at /tmp/oc_model_v2.py was used", P) == ""   # a word follows: the end is unclear, the line goes (round 3)
 # forms that used to pass as clean
 for line in ["AWS_SECRET_ACCESS_KEY=abcd1234efgh", "Use access code 482915", "Call 4155551212 tomorrow",
              r"\\server\client\private.txt", "client_secret: xyz789"]:
@@ -96,3 +96,53 @@ for ok in ["The client retains ownership of the deliverables.", "Display red fla
            "Revenue grew to 1068000 in Y1", "Stakeholders meet on Monday", "Order 12345678 shipped"]:
     assert not flagged(ok), ok
 print("share tests (round 2): all passed")
+
+# --- Codex round 3 ---------------------------------------------------------------------------------------------
+from zme_mcp.share import digest  # noqa: E402
+# unknown chunker versions never cross
+snap = Snapshot("s5", "T", "note", None, "text", [{"chunk_index": 0, "content": "c", "context_prefix": None, "heading": None,
+       "token_count": 3, "embedding": None, "embed_variant": None, "chunker_version": "CustomSecret"}])
+assert prepare(Scan(snap, []), P, "as-is")["chunks"][0]["chunker_version"] is None
+# approval is bound to the exact payload
+a = prepare(Scan(Snapshot("s6", "T", "note", None, "safe text here", []), []), P, "as-is")
+b = prepare(Scan(Snapshot("s6", "T", "note", None, "safe text here, plus an acquisition ceiling", []), []), P, "as-is")
+assert digest(P, "as-is", a) != digest(P, "as-is", b) and digest(P, "as-is", a) == digest(P, "as-is", dict(a))
+assert digest(P, "as-is", a) != digest("ecis", "as-is", a) and digest(P, "as-is", a) != digest(P, "redacted", a)
+# YAML blocks and escaped newlines inside quotes
+out = redact("keep\npassword: |\n  synthetic-super-secret\n  second line\nafter", P)
+assert "synthetic" not in out and "second line" not in out and out == "keep\nafter", out
+out = redact("keep\napi_key: >\n  folded-secret-value\nafter", P)
+assert "folded" not in out and out == "keep\nafter", out
+out = redact('keep\npassword: "first \\\ncontinued secret"\nafter', P)
+assert "continued" not in out and out == "keep\nafter", out
+# paths: a dot is not a boundary; file URIs; apostrophes inside double quotes
+out = redact("keep\nsee /Users/alex/Acme.Inc Bankruptcy Case/settlement.xlsx now\nafter", P)
+assert "Bankruptcy" not in out and out == "keep\nafter", out
+out = redact("keep\nfile:///Users/alex/Acme Bankruptcy Case/settlement.xlsx\nafter", P)
+assert "Bankruptcy" not in out and out == "keep\nafter", out
+out = redact('see "/Users/alex/Client\'s Private Files/settlement.xlsx" now', P)
+assert "Private Files" not in out and "settlement" not in out, out
+assert redact("file at /tmp/oc_model_v2.py.", P) == "file at [removed]"   # trailing punctuation goes with the path
+# percent-encoded URLs
+snap = Snapshot("s7", "T", "note", "https://example.org/Custom%53ecret", "text long enough to share", [])
+assert any(f.where.startswith("url") for f in scan_snapshot(P, snap, ["CustomSecret"]))
+assert prepare(Scan(snap, []), P, "redacted", ["CustomSecret"])["url"] is None
+# replacement titles are checked and redacted like titles
+try:
+    prepare(Scan(Snapshot("s8", "our floor is 20%", "note", None, "text long enough here", []), []), P, "redacted", title="Our floor plan")
+    raise AssertionError("a flagged replacement title was accepted")
+except ValueError:
+    pass
+pay = prepare(Scan(Snapshot("s9", "x", "note", None, "text long enough here", []), []), P, "redacted", ["CustomSecret"], title="Client CustomSecret plan")
+assert "CustomSecret" not in pay["title"] and all("CustomSecret" not in (c["context_prefix"] or "") for c in pay["chunks"]), pay
+# more forms
+for line in ["Authorization: Bearer abcdef1234567890", "Use access code bluebird", "Call (415)5551212 tomorrow"]:
+    assert flagged(line), line
+assert "abcdef1234567890" not in redact("Authorization: Bearer abcdef1234567890", P)
+assert "bluebird" not in redact("Use access code bluebird", P)
+assert "5551212" not in redact("Call (415)5551212 tomorrow", P)
+# fewer destructive false positives
+for ok in ["The HTML markup includes accessible labels", "Authentication is passwordless: true for this service",
+           "token_count: 512 per chunk", "Tokens: 500 used"]:
+    assert not flagged(ok), ok
+print("share tests (round 3): all passed")

@@ -16,7 +16,9 @@ Commands:
   drop <id> --confirm <id>                 delete the workspace and everything in it
   embed-pending                            add vectors to chunks stored without one (run on the tailnet)
   share <id> <zeug-source-id>... [--preview] [--publish] [--accept SRC ...] [--redact SRC ...] [--mask WORD ...]
-        [--title SRC=TITLE ...] --as EMAIL   scan, preview every outgoing field, publish only the sources you name
+        [--title SRC=TITLE ...] [--approve SRC=DIGEST ...] --as EMAIL
+                                           scan; --preview prints every outgoing field and a digest; --publish writes
+                                           only named sources whose payload still matches the approved digest
   shares <id>                              what was shared into the workspace, by whom and how
 """
 from __future__ import annotations
@@ -54,6 +56,7 @@ def main() -> int:
     sh.add_argument("--mask", nargs="*", default=[], help="extra literals to flag and remove (never committed)")
     sh.add_argument("--title", nargs="*", default=[], help="SRC=replacement title, when the title itself is flagged")
     sh.add_argument("--preview", action="store_true", help="print the exact payload that would be published")
+    sh.add_argument("--approve", nargs="*", default=[], help="SRC=DIGEST printed by --preview; publication needs it")
     shs = sub.add_parser("shares"); shs.add_argument("id")
     args = ap.parse_args()
 
@@ -78,8 +81,9 @@ def main() -> int:
         print(ws.copy_from_zeug(args.id, args.source_id, actor=args.actor))
     elif args.cmd == "share":
         # Nothing publishes unless it is named in --accept (as is) or --redact; a clean scan is not approval.
-        from zme_mcp.share import prepare, preview, publish, scan
+        from zme_mcp.share import digest, prepare, preview, publish, scan
         titles = dict(x.split("=", 1) for x in args.title)
+        approvals = dict(x.split("=", 1) for x in args.approve)
         for s in scan(ws, args.id, args.sources, args.mask):
             mode = "redacted" if s.source_id in args.redact else "as-is" if s.source_id in args.accept else None
             state = mode or ("not approved" if not s.flags else "held")
@@ -98,8 +102,9 @@ def main() -> int:
             if args.preview:
                 print(f"   --- {mode} payload ---")
                 print("\n".join("   " + line for line in preview(payload).splitlines()))
+                print(f"   to publish exactly this: --approve {s.source_id}={digest(args.id, mode, payload)}")
             if args.publish:
-                status, new_id = publish(ws, args.id, s, mode, args.actor, payload)
+                status, new_id = publish(ws, args.id, s, mode, args.actor, payload, approvals.get(s.source_id))
                 print(f"   {status}{' as ' + new_id if new_id else ''}")
     elif args.cmd == "shares":
         with __import__("psycopg").connect(ws.dsn) as conn:
