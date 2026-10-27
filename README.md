@@ -109,6 +109,47 @@ zme-mcp --http --host 0.0.0.0 --port 8000
 - The only write is `remember`, which calls `zme_remember()`: a `SECURITY DEFINER` function whose entire capability is "create one note". No UPDATE, no DELETE, no schema access.
 - The HTTP layer never logs keys; the token is compared, not echoed.
 
+## Client workspaces (ZEUG-795)
+
+Each cmd.zeuglab.com project can get its own memory on omarchy ZME, separate from Zeug's memory and from every other client. The MCP endpoint that serves them is ZEUG-796; this is the database layer and an admin CLI.
+
+**Layout.** Project `ecis` lives in schema `ws_ecis` (hyphens become underscores) with `sources` and `chunks` tables, the same hybrid search as ZME (HNSW cosine + RUM lexical, fused with RRF), and two roles: `zme_ws_ecis_read` and `zme_ws_ecis_write` (add-only: no update, no delete). Control functions live in schema `zme_ws`, which PostgREST does not expose.
+
+**Two locks.**
+1. *Privileges.* Only a workspace's own roles can use its schema. No workspace role holds any privilege on Zeug's memory in `public`, on pg_net, or on another workspace.
+2. *Row-level security, forced,* keyed to the workspace the session declares (`zme.workspace`). A wrongly granted role still sees no rows unless the session also declares that workspace.
+
+Services do not log in as workspace roles. cmd (and, later, the MCP server in ZEUG-796) call the narrow API in `migrations/003_cmd_gateway.sql`: one call names one workspace and one level, and the database keeps it inside that workspace. `zme_ws_gateway` is reserved and holds no memberships. The CLI and `Workspaces` in `src/zme_mcp/workspace.py` connect as postgres for administration: per call they switch to one workspace role (`set local role`) and declare that workspace (`set_config('zme.workspace', …, true)`).
+
+**Trust boundary.** cmd is the authority on who is on which project. A leaked cmd key or a compromised cmd reaches client workspaces at the levels cmd could use, never Zeug's memory.
+
+**Setup and checks** (as `postgres` unless noted):
+
+```bash
+psql "$ZME_DB" -f migrations/001_workspaces.sql            # idempotent; re-run after changing provision()
+psql "$ZME_DB_SUPERUSER" -f migrations/002_net_hardening.sql  # once, as supabase_admin
+psql "$ZME_DB" -f migrations/003_cmd_gateway.sql           # cmd gateway (zme_ws_caller); idempotent
+psql "$ZME_DB" -X -v ON_ERROR_STOP=1 -f tests/workspace_isolation.sql   # 59 checks, rolls back; exits non-zero on any failure
+```
+
+**CLI** (`ZME_WS_DSN` is a libpq string; the password is injected per call):
+
+```bash
+export ZME_WS_DSN="host=100.118.214.24 port=54322 dbname=postgres user=postgres sslmode=disable"
+zk() { ~/.local/bin/zeug-key run PGPASSWORD=zeuglab/zme/DB_PASSWORD -- python3 scripts/zme_ws.py "$@"; }
+zk create ecis --title "ECIS"
+zk add ecis --file kickoff.md --as alex@zeuglab.com
+zk search ecis "who owns the Xactimate export"
+zk copy ecis <zeug-source-id>          # owner copies one Zeug source in, vectors included
+zk drop ecis --confirm ecis            # deletes the workspace and everything in it
+```
+
+Notes are chunked and embedded on write (ollama `snowflake-arctic-embed:335m`, the arctic-l space Zeug's memory uses), so they are searchable as soon as `add` returns. Without an embedding service, notes are stored without vectors and search uses the lexical arm.
+
+**cmd.zeuglab.com** reaches workspaces through the public ZME front door (PostgREST) with one JWT for role `zme_ws_caller` (`migrations/003_cmd_gateway.sql`, Zeug Keys `zeuglab/zeug-cmd/ZME_WS_JWT`, minted with the PostgREST secret, valid a year). That role can execute `public.zme_ws_call` (status, search, sources, fetch, add) and `public.zme_ws_setup` and nothing else; cmd passes the project, the access level and the person's email. Notes added from cmd have no vectors until `zme_ws.py embed-pending` runs on the tailnet; until then they are found by the lexical arm.
+
+Every role can read the catalog (table names, function bodies), so never put a secret in a function body.
+
 ## Development
 
 ```bash
