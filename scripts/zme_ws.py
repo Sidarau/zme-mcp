@@ -15,8 +15,8 @@ Commands:
   copy <id> <zeug-source-id> [--as EMAIL]  copy one source from Zeug's memory (owner only)
   drop <id> --confirm <id>                 delete the workspace and everything in it
   embed-pending                            add vectors to chunks stored without one (run on the tailnet)
-  share <id> <zeug-source-id>... [--publish] [--accept SRC ...] [--redact SRC ...] [--mask WORD ...] --as EMAIL
-                                           scan Zeug sources for internal lines, then publish the ones you approve
+  share <id> <zeug-source-id>... [--preview] [--publish] [--accept SRC ...] [--redact SRC ...] [--mask WORD ...]
+        [--title SRC=TITLE ...] --as EMAIL   scan Zeug sources, preview, then publish the ones you approve
   shares <id>                              what was shared into the workspace, by whom and how
 """
 from __future__ import annotations
@@ -51,7 +51,9 @@ def main() -> int:
     sh = sub.add_parser("share"); sh.add_argument("id"); sh.add_argument("sources", nargs="+")
     sh.add_argument("--publish", action="store_true"); sh.add_argument("--accept", nargs="*", default=[])
     sh.add_argument("--redact", nargs="*", default=[]); sh.add_argument("--as", dest="actor", required=True)
-    sh.add_argument("--mask", nargs="*", default=[], help="extra literals to remove when redacting (never committed)")
+    sh.add_argument("--mask", nargs="*", default=[], help="extra literals to flag and remove (never committed)")
+    sh.add_argument("--title", nargs="*", default=[], help="SRC=replacement title, when the title itself is flagged")
+    sh.add_argument("--preview", action="store_true", help="print the exact payload that would be published")
     shs = sub.add_parser("shares"); shs.add_argument("id")
     args = ap.parse_args()
 
@@ -75,16 +77,28 @@ def main() -> int:
     elif args.cmd == "copy":
         print(ws.copy_from_zeug(args.id, args.source_id, actor=args.actor))
     elif args.cmd == "share":
-        from zme_mcp.share import publish, scan
-        for s in scan(ws, args.id, args.sources):
+        from zme_mcp.share import prepare, publish, scan
+        titles = dict(x.split("=", 1) for x in args.title)
+        for s in scan(ws, args.id, args.sources, args.mask):
             mode = "redacted" if s.source_id in args.redact else "as-is" if (not s.flags or s.source_id in args.accept) else None
-            print(f"\n{s.source_id}  {s.title}  [{s.source_type}, {len(s.text)} chars]  flags: {len(s.flags)}  -> {mode or 'held'}")
-            for f in s.flags[:12]:
-                print(f"   line {f.line}: {f.reason}: {f.text}")
-            if len(s.flags) > 12:
-                print(f"   ... {len(s.flags) - 12} more")
-            if args.publish and mode:
-                print(f"   published as {publish(ws, args.id, s, mode, args.actor, args.mask)}")
+            print(f"\n{s.source_id}  {s.snap.title}  [{s.snap.source_type}, {len(s.snap.text)} chars]  flags: {len(s.flags)}  -> {mode or 'held'}")
+            for f in s.flags[:15]:
+                print(f"   {f.where} line {f.line}: {f.reason} ({f.action}): {f.text}")
+            if len(s.flags) > 15:
+                print(f"   ... {len(s.flags) - 15} more")
+            if not mode or not (args.publish or args.preview):
+                continue
+            try:
+                payload = prepare(s, args.id, mode, args.mask, titles.get(s.source_id))
+            except ValueError as e:
+                print(f"   held: {e}")
+                continue
+            if args.preview:
+                print(f"   --- {mode} payload: title {payload['title']!r}, url {payload['url']!r}, {len(payload['chunks'])} chunks ---")
+                print("\n".join("   | " + line for line in payload["text"].splitlines()))
+            if args.publish:
+                status, new_id = publish(ws, args.id, s, mode, args.actor, payload)
+                print(f"   {status}{' as ' + new_id if new_id else ''}")
     elif args.cmd == "shares":
         with __import__("psycopg").connect(ws.dsn) as conn:
             show([dict(zip(("source", "copy", "mode", "flags", "by", "at"), r)) for r in conn.execute(

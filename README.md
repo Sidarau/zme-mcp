@@ -154,11 +154,12 @@ Every role can read the catalog (table names, function bodies), so never put a s
 
 ```bash
 zk share ecis <zeug-source-id> ...                         # dry run: flags per source, nothing written
-zk share ecis <ids> --publish [--accept ID ...] [--redact ID ...] [--mask WORD ...] --as alex@zeuglab.com
+zk share ecis <ids> --preview --redact ID ...                # the exact text that would be published
+zk share ecis <ids> --publish [--accept ID ...] [--redact ID ...] [--mask WORD ...] [--title ID=New title] --as alex@zeuglab.com
 zk shares ecis                                             # audit: what was shared, how, by whom
 ```
 
-The scan (`src/zme_mcp/share.py`) flags other clients' names, negotiating positions, ownership and Zeug-finance talk, assessments of people, personal data, secrets and access codes, contact details and local paths. A clean source is copied as is, vectors included. A flagged source is held unless it is accepted (the flags were false alarms) or redacted. Redacting masks secrets, contact details and paths in place, drops the other flagged lines, then re-chunks and re-embeds. Local file URLs never cross. Every publish is recorded in `zme_ws.shares`. The scan is a tripwire, not a judge: read what you publish.
+Each source is read once into a snapshot; that snapshot is what is scanned (title, text, and every chunk's content, prefix and heading) and what is published, in one transaction with its audit row. A source already shared into the workspace is skipped. The scan (`src/zme_mcp/share.py`, regression cases in `tests/test_share.py`) flags other clients' names, negotiating positions, ownership and Zeug-finance talk, assessments of people, personal data, secrets and access codes, contact details and local paths. A clean source is copied as is, vectors included. A flagged source is held unless it is accepted (the flags were false alarms) or redacted. Redacting replaces spans with a known extent (tokens, emails, phone numbers, paths, masked literals, parenthesised access codes) in place and drops every other flagged line, including credential assignments, then re-chunks and re-embeds. A flagged title needs `--title`. URLs cross only as plain http(s) without credentials, query or fragment. Every publish is recorded in `zme_ws.shares`. The scan is a tripwire, not a judge: read what you publish.
 
 ## Development
 
