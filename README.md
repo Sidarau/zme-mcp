@@ -128,6 +128,7 @@ Services do not log in as workspace roles. cmd (and, later, the MCP server in ZE
 ```bash
 psql "$ZME_DB" -f migrations/001_workspaces.sql            # idempotent; re-run after changing provision()
 psql "$ZME_DB_SUPERUSER" -f migrations/002_net_hardening.sql  # once, as supabase_admin
+psql "$ZME_DB" -f migrations/003_cmd_gateway.sql           # cmd gateway (zme_ws_caller); idempotent
 psql "$ZME_DB" -X -v ON_ERROR_STOP=1 -f tests/workspace_isolation.sql   # 59 checks, rolls back; exits non-zero on any failure
 ```
 
