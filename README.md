@@ -150,6 +150,16 @@ Notes are chunked and embedded on write (ollama `snowflake-arctic-embed:335m`, t
 
 Every role can read the catalog (table names, function bodies), so never put a secret in a function body.
 
+**Sharing from Zeug's memory (explicit only).** Zeug's memory is internal by default; nothing reaches a client workspace unless someone runs `share` for named sources and a named project:
+
+```bash
+zk share ecis <zeug-source-id> ...                         # dry run: flags per source, nothing written
+zk share ecis <ids> --publish [--accept ID ...] [--redact ID ...] [--mask WORD ...] --as alex@zeuglab.com
+zk shares ecis                                             # audit: what was shared, how, by whom
+```
+
+The scan (`src/zme_mcp/share.py`) flags other clients' names, negotiating positions, ownership and Zeug-finance talk, assessments of people, personal data, secrets and access codes, contact details and local paths. A clean source is copied as is, vectors included. A flagged source is held unless it is accepted (the flags were false alarms) or redacted. Redacting masks secrets, contact details and paths in place, drops the other flagged lines, then re-chunks and re-embeds. Local file URLs never cross. Every publish is recorded in `zme_ws.shares`. The scan is a tripwire, not a judge: read what you publish.
+
 ## Development
 
 ```bash
