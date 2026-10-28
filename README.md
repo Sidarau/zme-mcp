@@ -163,6 +163,15 @@ Each source is read once into a snapshot; that snapshot is what is scanned (titl
 
 ## Development
 
+### Quick project references
+
+Owner tooling: `scripts/zme-project sync`, `scripts/zme-project alias oc opencollective`, then
+`scripts/zme-project ref @oc` or `scripts/zme-project search @oc 'question'`.
+New collaborator notes use a local draft, full preview and explicit digest approval before publishing.
+See [the project memory workflow](docs/project-memory-workflow.md) for setup, limits and collaborator connections.
+
+Offline checks: `python3 -m unittest discover -s tests -p 'test_project*.py'` and `python3 tests/test_share.py`.
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e .
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}' | .venv/bin/zme-mcp

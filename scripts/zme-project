@@ -1,0 +1,25 @@
+#!/bin/sh
+# Owner-only checkout launcher. Only live commands retrieve a credential, never offline drafts/previews.
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python_bin=${ZME_PROJECT_PYTHON:-"$script_dir/../.venv/bin/python"}
+if [ ! -x "$python_bin" ]; then
+  echo 'Create .venv with Python 3.10+ and install psycopg[binary], or set ZME_PROJECT_PYTHON.' >&2
+  exit 1
+fi
+# A custom registry is a global option and precedes the command.
+command_name=${1:-}
+if [ "$command_name" = '--registry' ]; then
+  if [ "$#" -lt 3 ]; then
+    echo 'Usage: zme-project [--registry FILE] COMMAND ...' >&2
+    exit 1
+  fi
+  command_name=$3
+fi
+case "$command_name" in
+  sync|search|sources|publish|share)
+    export ZME_WS_DSN=${ZME_WS_DSN:-'host=100.118.214.24 port=54322 dbname=postgres user=postgres sslmode=disable connect_timeout=8'}
+    exec "$HOME/.local/bin/zeug-key" run PGPASSWORD=zeuglab/zme/DB_PASSWORD -- "$python_bin" "$script_dir/zme_project.py" "$@"
+    ;;
+  *) exec "$python_bin" "$script_dir/zme_project.py" "$@" ;;
+esac
