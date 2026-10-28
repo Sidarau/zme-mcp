@@ -28,7 +28,8 @@ import json
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE / "_project_memory" if (_HERE / "_project_memory").is_dir() else _HERE.parent / "src"))
 from zme_mcp.workspace import Workspaces  # noqa: E402
 
 
