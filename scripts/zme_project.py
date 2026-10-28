@@ -12,8 +12,9 @@ import pathlib
 import subprocess
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-from zme_mcp.projects import ValidationError, Registry, packet, preview, publish, references, save_private
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE / "_project_memory" if (_HERE / "_project_memory").is_dir() else _HERE.parent / "src"))
+from zme_mcp.projects import ValidationError, Registry, initialize, packet, preview, publish, references, save_private
 
 
 def workspace():
@@ -33,6 +34,9 @@ def main(argv=None) -> int:
     sub.add_parser("sync", help="import provisioned workspace ids, preserving aliases; read-only on the server")
     reg = sub.add_parser("register", help="register an exact CMD id locally; does not create a workspace or grant access")
     reg.add_argument("id"); reg.add_argument("--name", required=True)
+    init = sub.add_parser("init", help="scaffold a local future project with collaborator-draft defaults; no server changes")
+    init.add_argument("id"); init.add_argument("--name", required=True)
+    init.add_argument("--alias", action="append", default=[]); init.add_argument("--target", type=pathlib.Path, required=True)
     alias = sub.add_parser("alias"); alias.add_argument("alias"); alias.add_argument("project")
     for cmd in ("ref", "sources"):
         sub.add_parser(cmd).add_argument("project")
@@ -62,6 +66,8 @@ def main(argv=None) -> int:
         elif args.command == "register":
             registry.register(args.id, args.name); registry.save()
             show(references(registry.resolve(args.id)))
+        elif args.command == "init":
+            show(initialize(registry, args.id, args.name, args.alias, args.target))
         elif args.command == "alias":
             registry.alias(args.project, args.alias); registry.save()
             show(references(registry.resolve(args.project)))

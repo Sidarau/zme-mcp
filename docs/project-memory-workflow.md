@@ -26,6 +26,8 @@ Only the owner launcher retrieves the existing DB credential through Zeug Keys, 
 
 ## Daily commands
 
+For a named project, excluding internal context and showing a collaborator draft are defaults. You can say “Prepare research for @project” without repeating those instructions. Preparing a draft never authorizes publication.
+
 ```sh
 scripts/zme-project search @ecis 'What did we agree about exports?'
 scripts/zme-project sources @oc
@@ -89,3 +91,13 @@ The scanner is a tripwire. ZEUG-808 tracks known redaction gaps; review every fi
 Open the project's CMD memory page and use **Connect** for that person's tools. Browser apps use the project OAuth connector where available; terminal tools use the project's installer and a per-person access key. Verify availability and the access level on that page. Never paste keys into chat or project memory. Each collaborator should receive only their project's connection. The owner's local aliases and database tooling are not a client setup package.
 
 This branch adds local owner tooling. It does not add autocomplete to CMD, a ChatGPT slash command, an automatic sync job, or a new authentication path. A future CMD project picker can use the same exact-id convention after review.
+
+## Reuse for a future project
+
+```sh
+zme-project init sample-project --name 'Sample project' --alias sample --target ./sample-work
+```
+
+Use the exact CMD project id. The command creates owner-only routing metadata in `.zeug/memory-routing.json`, a `MEMORY.md` policy and three local draft starting points. It does not create a server workspace, change permissions, add credentials or publish content. It refuses existing target files and preserves the collaborator profile `.zeug/project.json`. The template carries the same draft defaults to each future project.
+
+Fleet agents receive the portable runtime and this default policy through the shared `zme` skill. Existing running chats must re-read the updated skill, or start a new chat. A browser refresh does not update an agent's loaded instructions. Connector reauthentication is a separate action.

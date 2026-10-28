@@ -16,6 +16,7 @@ from .text import chunk
 ID = re.compile(r"[a-z0-9][a-z0-9-]{1,40}\Z")
 RESERVED = {"internal", "public", "zeug", "zeuglab", "all", "default"}
 KINDS = {"note": "note", "context": "analysis", "research": "compiled_research"}
+DEFAULTS = {"exclude_internal": True, "preview_required": True, "auto_publish": False}
 FIELDS = {"version", "project", "actor", "kind", "title", "text", "url"}
 
 
@@ -110,12 +111,48 @@ class Registry:
 def references(p: dict) -> dict:
     pid = p["id"]
     return {"project": pid, "name": p["title"], "references": ["@" + x for x in [pid, *p["aliases"]]],
+            "defaults": dict(DEFAULTS),
             "workspace": f"https://cmd.zeuglab.com/p/{pid}",
             "memory": f"https://cmd.zeuglab.com/p/{pid}/memory",
             "connector": f"https://mcp.zeuglab.com/w/{pid}",
             "prompt": f"Use @{pid}. Prepare a collaborator-facing note for this project only. "
                       "Keep internal strategy, finances, people assessments, other clients, personal data and access details out. "
                       "Show the complete draft before publishing. This reference does not grant access or authorize sharing."}
+
+
+def initialize(registry: Registry, pid: str, title: str, aliases: list[str], target: pathlib.Path) -> dict:
+    """Scaffold local owner routing for a future CMD project; never provision, grant or publish."""
+    # Validate a proposed registry separately so failures leave the caller's registry unchanged.
+    proposed = Registry(registry.path)
+    project = proposed.register(pid, title)
+    for alias in aliases:
+        proposed.alias(project["id"], alias)
+    if any(ord(c) < 32 for c in title) or "\n" in title:
+        raise ValidationError("project name must be a single line")
+    base = pathlib.Path(__file__).with_name("project_template")
+    config = {"version": 1, "project": project["id"], "name": title, "aliases": project["aliases"],
+              "defaults": dict(DEFAULTS), "memory": references(project)["memory"],
+              "connector": references(project)["connector"], "role": "owner-routing-only"}
+    files = {".zeug/memory-routing.json": json.dumps(config, indent=2) + "\n"}
+    for name in ("MEMORY.md", "context.md", "research.md", "notes.md"):
+        files[name] = (base / name).read_text().replace("{{PROJECT_REF}}", "@" + project["id"])
+    # Preflight every destination, including dangling symlinks, before creating any files.
+    if target.is_symlink() or (target / ".zeug").is_symlink():
+        raise ValidationError("template target cannot be a symlink")
+    for relative in files:
+        path = target / relative
+        if path.exists() or path.is_symlink():
+            raise ValidationError("template would overwrite existing files; choose an empty target")
+    for relative, text in files.items():
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+    proposed.save()
+    registry.data = proposed.data
+    return {"project": project["id"], "target": str(target), "files": list(files), "defaults": dict(DEFAULTS),
+            "provisioned": False, "published": False}
 
 
 def packet(project: str, actor: str, kind: str, title: str, text: str, url: str | None = None) -> dict:

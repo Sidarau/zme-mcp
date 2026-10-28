@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from zme_mcp.projects import Registry, approval, packet, payload, preview, publish, save_private
+from zme_mcp.projects import DEFAULTS, Registry, approval, initialize, packet, payload, preview, publish, references, save_private
 
 spec = importlib.util.spec_from_file_location("project_cli", ROOT / "scripts/zme_project.py")
 cli = importlib.util.module_from_spec(spec)
@@ -36,6 +36,34 @@ class ProjectTests(unittest.TestCase):
         for bad in ("", "internal", "public", "zeug", "@all", "default", "eci", "Open Collective", "../ecis"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.registry.resolve(bad)
+
+    def test_future_project_template_is_offline_and_defaults_to_draft(self):
+        target = pathlib.Path(self.temp.name) / "future-project"
+        with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")):
+            result = initialize(self.registry, "sample-project", "Sample project", ["sample"], target)
+        self.assertFalse(result["provisioned"])
+        self.assertFalse(result["published"])
+        config = json.loads((target / ".zeug/memory-routing.json").read_text())
+        self.assertEqual(config["defaults"], DEFAULTS)
+        self.assertTrue(config["defaults"]["exclude_internal"])
+        self.assertTrue(config["defaults"]["preview_required"])
+        self.assertFalse(config["defaults"]["auto_publish"])
+        self.assertEqual(Registry(self.path).resolve("@sample")["id"], "sample-project")
+        for name in result["files"]:
+            self.assertEqual((target / name).stat().st_mode & 0o777, 0o600)
+        self.assertFalse((target / ".zeug/project.json").exists())
+        self.assertEqual(references(self.registry.resolve("@sample"))["defaults"], DEFAULTS)
+
+    def test_template_collision_preserves_all_files_and_registry(self):
+        target = pathlib.Path(self.temp.name) / "existing"
+        target.mkdir()
+        (target / "research.md").write_text("Keep my work")
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            initialize(self.registry, "sample-project", "Sample project", ["sample"], target)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((target / "research.md").read_text(), "Keep my work")
+        self.assertFalse((target / "MEMORY.md").exists())
 
     def test_alias_collision_does_not_reassign(self):
         with self.assertRaises(ValueError):
@@ -138,7 +166,7 @@ class ProjectTests(unittest.TestCase):
                                "--out", str(pathlib.Path(self.temp.name) / "draft.json")])
         self.assertEqual(result, 1)
         self.assertNotIn(secret, stderr.getvalue())
-        self.assertIn("invalid public source URL", stderr.getvalue())
+        self.assertIn("Refused:", stderr.getvalue())
 
     def test_cli_draft_never_connects_and_preserves_input(self):
         source = pathlib.Path(self.temp.name) / "selected.md"
