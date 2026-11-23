@@ -48,10 +48,17 @@ ring `beta` onwards.
 
 ## Configuration
 
+Internal ZME and Terminal Finance use self-hosted Postgres/PostgREST on
+Omarchy. Configure internal clients explicitly with the [ZME cloud gateway](https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws),
+or the tailnet REST base `http://100.118.214.24:54321` where reachable. Some
+older MCP builds still default to the retired hosted project. The names
+`ZME_SUPABASE_URL` and `ZME_SUPABASE_KEY` are compatibility settings for the
+PostgREST connection. See the [ZME operating guide](https://github.com/Sidarau/zeug-command/tree/main/docs/zme).
+
 | Variable | Required | Purpose |
 |---|---|---|
-| `ZME_SUPABASE_KEY` | yes | Supabase key for the ZME project. **The anon key is enough** (SELECT-only + `zme_remember`). Never deploy a service-role key on a shared machine. |
-| `ZME_SUPABASE_URL` | no | Defaults to Zeug's own memory project. Point at another ZME deployment (e.g. a ClawPanel tenant DB) to serve that instead. |
+| `ZME_SUPABASE_KEY` | yes | JWT for the configured ZME endpoint. Use the scoped ZME anon credential for inspection and the note RPC where granted. Keep server credentials out of shared client configuration. |
+| `ZME_SUPABASE_URL` | set explicitly | Base URL of the intended PostgREST deployment, without `/rest/v1`. For internal ZME, use the gateway or tailnet base above. |
 | `NVIDIA_API_KEY` | no | Enables the vector arm of hybrid search. Without it, everything still works in lexical mode (which is the arm that catches exact identifiers). |
 | `ZME_AUTH` | no | `oauth` (default when profiles are set) or `token` (alpha ring only). |
 | `ZME_OAUTH_PROFILES` | oauth | JSON map of profile name → `{secret, level}`. |
@@ -59,14 +66,16 @@ ring `beta` onwards.
 | `ZME_RING` | no | `alpha` (default) / `beta` / `prod` — release channel gates. |
 | `ZME_MCP_TOKEN` | token mode | Shared bearer for the HTTP endpoint. |
 
-On macOS, keys are also auto-resolved from the NoxKey keychain (one Touch ID prompt per session) when the env vars are absent.
+On enrolled Zeug hosts, inject the internal ZME credential at launch with `zeug-key run ZME_SUPABASE_KEY=zeuglab/zme/ANON_JWT -- <command>`.
 
 ## Install & run — local agents (stdio)
 
 No install needed with uv (any machine with Python):
 
 ```bash
-uvx --from git+https://github.com/Sidarau/zme-mcp zme-mcp
+ZME_SUPABASE_URL=https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws \
+  zeug-key run ZME_SUPABASE_KEY=zeuglab/zme/ANON_JWT -- \
+  uvx --from git+https://github.com/Sidarau/zme-mcp zme-mcp
 ```
 
 or pipx: `pipx install git+https://github.com/Sidarau/zme-mcp` ·
@@ -81,7 +90,10 @@ PyPI (`uvx zme-mcp`) once the package is published there.
   "zme": {
     "command": "uvx",
     "args": ["--from", "git+https://github.com/Sidarau/zme-mcp", "zme-mcp"],
-    "env": { "ZME_SUPABASE_KEY": "…", "NVIDIA_API_KEY": "…" }
+    "env": {
+      "ZME_SUPABASE_URL": "https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws",
+      "ZME_SUPABASE_KEY": "<scoped ZME JWT>"
+    }
   }
 }
 ```
