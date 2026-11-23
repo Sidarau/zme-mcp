@@ -78,21 +78,25 @@ ZME_SUPABASE_URL=https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.o
   uvx --from git+https://github.com/Sidarau/zme-mcp zme-mcp
 ```
 
-or pipx: `pipx install git+https://github.com/Sidarau/zme-mcp` ·
-PyPI (`uvx zme-mcp`) once the package is published there.
+To install it persistently, use `pipx install git+https://github.com/Sidarau/zme-mcp` and launch `zme-mcp` with the same endpoint and credential injection. GUI clients may need the absolute path to the installed `zeug-key`.
 
-**Claude Code** — `claude mcp add zme -- uvx --from git+https://github.com/Sidarau/zme-mcp zme-mcp`
+**Claude Code**
+
+```bash
+claude mcp add --env ZME_SUPABASE_URL=https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws \
+  zme -- zeug-key run ZME_SUPABASE_KEY=zeuglab/zme/ANON_JWT -- \
+  uvx --from git+https://github.com/Sidarau/zme-mcp zme-mcp
+```
 
 **Claude Desktop / Cursor** (`mcpServers` JSON):
 
 ```json
 {
   "zme": {
-    "command": "uvx",
-    "args": ["--from", "git+https://github.com/Sidarau/zme-mcp", "zme-mcp"],
+    "command": "zeug-key",
+    "args": ["run", "ZME_SUPABASE_KEY=zeuglab/zme/ANON_JWT", "--", "uvx", "--from", "git+https://github.com/Sidarau/zme-mcp", "zme-mcp"],
     "env": {
-      "ZME_SUPABASE_URL": "https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws",
-      "ZME_SUPABASE_KEY": "<scoped ZME JWT>"
+      "ZME_SUPABASE_URL": "https://pqhc4ss3c2ho4fokxyp2anjpoi0mbmkt.lambda-url.us-west-2.on.aws"
     }
   }
 }
